@@ -10,6 +10,112 @@ One Go binary, three subcommands:
 
 Supported connectors: **Mattermost**, **Gmail**, **Telegram**, and **Kaneo** (webhook-based project tracker events). Courier is connector-agnostic at its core: a connector only needs to normalize events into the ledger and post replies.
 
+## How it works
+
+### The shape of the system
+
+```text
+┌─────────────────────────── external applications ──────────────────────────┐
+│  Mattermost (websocket)   Gmail (historyId poll)   Telegram / Kaneo        │
+│                          (webhooks, loopback listener)                     │
+└──────────────────────────────────┬─────────────────────────────────────────┘
+                                   ▼  push or pull, per connector
+┌─────────────────────────────── courier serve ──────────────────────────────┐
+│                                                                            │
+│   connectors ──normalize──▶ EVENTS ──▶ DELIVERIES ────▶ dispatcher         │
+│        ▲                   (deduped by   (one open         │ claim oldest  │
+│        │                    connector +   delivery per      │ on each tick │
+│        │                    event_key)    event, addressed  ▼              │
+│        │                                  to the target)   envelope       │
+│   PostReply ◀── replies ◀──────────────  `courier/1` <msg …>              │
+│        │                                   (bounded pointer)  │            │
+└────────┼─────────────────────────────────────────────────────┼────────────┘
+         │ reply posted back                                herdr socket API
+         │                                                        │
+         │                                                        ▼
+         │                                          ┌───────────────────────┐
+         │                                          │ agent pane            │
+         │                                          │ label = COURIER_TARGET│
+         │      ┌─────────────────────┐              │ ┌───────────────────┐ │
+         └──────│ courier mcp (stdio) │◀── MCP ──────┼─│ read_message      │ │
+                │ shim, one per       │   tools      │ │ chat_reply        │ │
+                │ agent session       │              │ │ mark_handled      │ │
+                └──────────┬──────────┘              │ └───────────────────┘ │
+                           │ POST /tool/{name}       └───────────────────────┘
+                           ▼
+                    daemon IPC (127.0.0.1:8788 or unix socket)
+```
+
+Inbound: a connector normalizes the external event into a ledger row; the dispatcher
+claims the oldest unsettled delivery and pastes a bounded `<msg>` pointer into the
+agent's pane through herdr. Outbound: the agent calls MCP tools, the per-session shim
+forwards them to the daemon over IPC, and only `chat_reply` text ever reaches the
+external application — the terminal the agent types in is not a channel.
+
+### Who owns a channel
+
+Agents never register themselves at runtime. Ownership is declared once, daemon-side,
+and enforced on every call:
+
+```text
+ provision time ─▶ reconciler_state row (one per org):
+                     pane_label = COURIER_TARGET, agent kind, pane id,
+                     native session id, session generation
+
+ daemon startup ─▶ Reconcile: resolve the label in herdr
+                     ├─ present ────────────▶ refresh state
+                     ├─ label lost (restart)▶ relabel the restored agent by
+                     │                         session ▸ session-prefix ▸ pane
+                     │                         (ambiguous matches refuse)
+                     └─ absent ─────────────▶ start it in the recorded pane,
+                                              resume preferred over fresh
+
+ every tool call ─▶ the shim pins agent = COURIER_AGENT (the model cannot
+                     supply its own); a delivery owned by another agent
+                     gets 409 before anything is written
+```
+
+`COURIER_ORG` selects the ledger (and thus the reconciler_state row); `COURIER_TARGET`
+is the herdr pane label every delivery is addressed to. A missing reconciler_state row
+means the org was never provisioned — reconcile reports unavailable rather than
+guessing, and no prompt is attempted.
+
+### Acks and retries
+
+There are two acknowledgements, and only the second one settles anything:
+
+```text
+ ingest ─▶ EVENT ─▶ DELIVERY [pending]
+                         │
+        dispatcher tick: claim oldest ──▶ [dispatched] ──▶ <msg> prompt
+              ▲                                │
+              │                                ├─ prompt failed ─▶ back to
+              │                                │   [pending] + reconcile
+              │                                │   (target unavailable may
+              │                                │   also notify the channel)
+              │                                │
+              │  sweep: dispatched older than  │  a *successful* prompt is
+              │  backoff re-queues as pending  │  still NOT settlement —
+              │  backoff = min(grace×(read?4:1)│  only tools settle:
+              │            ×2^attempts, cap)  │
+              │                                ▼
+              │        read_message ─▶ stamps read_at once (receipt; slows
+              │                        the next backoff by the read factor)
+              │                                │
+              │        chat_reply ─▶ [replied] ─▶ PostReply to the app
+              │                          │         ├─ confirmed ─▶ [handled]
+              │                          │         └─ failed ─▶ post_error kept;
+              │                          │                     RetryPosts retries
+              │                          │                     every tick
+              │        mark_handled ──────────────▶ [handled]
+```
+
+Settlement writes `handled_at` through exactly one store path, shared by the confirmed
+post and `mark_handled`. Until then the delivery is redelivered forever with growing
+backoff — and an explicit banner telling the agent whether it previously read but never
+settled the message. A failed outbound post is retried by courier, not the agent: a
+repeat `chat_reply` is recognized as a duplicate and never double-posts.
+
 ## Requirements
 
 - Go 1.25+ (or [mise](https://mise.jdx.dev), which pins the toolchain in `mise.toml`)
