@@ -1,0 +1,18 @@
+[tools]
+go = "1.25.3"
+
+[tasks.test]
+run = "go test -race ./..."
+
+[tasks.vet]
+run = "go vet ./..."
+
+[tasks.build]
+# Atomic install: build to a temp name, rename into place — never hits ETXTBSY
+# from a running courier, and the rename is atomic for readers. A running
+# process keeps the OLD inode: restart it to pick up a rebuild.
+run = """
+go build -o /tmp/courier.build .
+mv /tmp/courier.build ~/.local/bin/courier
+echo "NOTE: a running courier binds the OLD inode — restart it to pick this up"
+"""
