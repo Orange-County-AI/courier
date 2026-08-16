@@ -62,9 +62,15 @@ CREATE TABLE post_state (
   delete_at INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE mattermost_threads (
+  channel_id TEXT NOT NULL,
+  root_id TEXT NOT NULL,
+  followed_at INTEGER NOT NULL,
+  PRIMARY KEY(channel_id, root_id)
+);
 CREATE TABLE watermarks (
   account TEXT PRIMARY KEY,
   history_id TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

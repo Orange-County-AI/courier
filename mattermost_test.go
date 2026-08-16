@@ -247,17 +247,26 @@ func mmTestDeliveryContext(t *testing.T, store *Store, event *Event) DeliveryCon
 	return DeliveryContext{Delivery: *delivery, Event: *event, ConversationID: event.ConversationID}
 }
 
-func TestMMConversationIDTopLevel(t *testing.T) {
-	if got := MMConversationIDFor(MMPost{ID: "p1", RootID: "", ChannelID: "c1"}); got != "c1" {
-		t.Fatalf("empty-root conversation = %q", got)
+func TestMMConversationIDTopLevelDM(t *testing.T) {
+	normalized := MMNormalized{
+		Post:      MMPost{ID: "p1", ChannelID: "c1"},
+		ChannelID: "c1", RootID: "p1", ChannelType: "D",
 	}
-	if got := MMConversationIDFor(MMPost{ID: "p1", RootID: "p1", ChannelID: "c1"}); got != "c1" {
-		t.Fatalf("self-root conversation = %q", got)
+	if got := MMConversationIDFor(normalized); got != "c1" {
+		t.Fatalf("top-level DM conversation = %q", got)
 	}
 }
 
-func TestMMConversationIDThread(t *testing.T) {
-	if got := MMConversationIDFor(MMPost{ID: "p2", RootID: "p1", ChannelID: "c1"}); got != "c1:p1" {
+func TestMMConversationIDChannelThread(t *testing.T) {
+	normalized := MMNormalized{
+		Post:      MMPost{ID: "p1", ChannelID: "c1"},
+		ChannelID: "c1", RootID: "p1", ChannelType: "O",
+	}
+	if got := MMConversationIDFor(normalized); got != "c1:p1" {
+		t.Fatalf("channel conversation = %q", got)
+	}
+	normalized.Post.ID, normalized.Post.RootID = "p2", "p1"
+	if got := MMConversationIDFor(normalized); got != "c1:p1" {
 		t.Fatalf("thread conversation = %q", got)
 	}
 }
@@ -308,8 +317,71 @@ func TestMMChannelMentionIngests(t *testing.T) {
 	if err := rig.connector.HandleEvent(context.Background(), event, raw, false); err != nil {
 		t.Fatal(err)
 	}
-	if stored := mmTestFindEvent(t, rig.store, "p1"); stored == nil || stored.ConversationID != "c1" {
+	if stored := mmTestFindEvent(t, rig.store, "p1"); stored == nil || stored.ConversationID != "c1:p1" {
 		t.Fatalf("mention event = %#v", stored)
+	}
+}
+func TestMMChannelMentionReplyStartsThread(t *testing.T) {
+	rig := mmNewTestRig(t)
+	event, raw := mmTestPosted(mmTestPost(), "O", func(data *MMPostedData) {
+		data.Mentions = mmMustJSON([]string{mmTestBot})
+	})
+	if err := rig.connector.HandleEvent(context.Background(), event, raw, false); err != nil {
+		t.Fatal(err)
+	}
+	stored := mmTestFindEvent(t, rig.store, "p1")
+	if err := rig.connector.PostReply(context.Background(), mmTestDeliveryContext(t, rig.store, stored), "answer"); err != nil {
+		t.Fatal(err)
+	}
+	rig.api.mu.Lock()
+	defer rig.api.mu.Unlock()
+	if len(rig.api.posts) != 1 || rig.api.posts[0].ChannelID != "c1" || rig.api.posts[0].RootID != "p1" {
+		t.Fatalf("posts = %#v", rig.api.posts)
+	}
+}
+
+func TestMMMentionPermanentlyFollowsThreadWithoutHistoryHeuristic(t *testing.T) {
+	rig := mmNewTestRig(t)
+	mention := mmTestPost(func(post *MMPost) { post.ID, post.ChannelID = "root1", "c2" })
+	event, raw := mmTestPosted(mention, "O", func(data *MMPostedData) {
+		data.Mentions = mmMustJSON([]string{mmTestBot})
+	})
+	if err := rig.connector.HandleEvent(context.Background(), event, raw, false); err != nil {
+		t.Fatal(err)
+	}
+	rig.api.threads["root1"] = MMPostList{Order: []string{"root1"}, Posts: map[string]MMPost{
+		"root1": {ID: "root1", CreateAt: 900, UserID: "u1", Message: "mention removed later"},
+	}}
+	reply := mmTestPost(func(post *MMPost) { post.ID, post.RootID, post.ChannelID = "p2", "root1", "c2" })
+	event, raw = mmTestPosted(reply, "O")
+	if err := rig.connector.HandleEvent(context.Background(), event, raw, false); err != nil {
+		t.Fatal(err)
+	}
+	stored := mmTestFindEvent(t, rig.store, "p2")
+	if stored == nil || stored.ConversationID != "c2:root1" || !strings.Contains(stored.Content, "thread reply") {
+		t.Fatalf("followed event = %#v", stored)
+	}
+}
+
+func TestMMMentionInsideThreadFollowsLaterUntaggedMessages(t *testing.T) {
+	rig := mmNewTestRig(t)
+	tagged := mmTestPost(func(post *MMPost) { post.ID, post.RootID = "p2", "root1" })
+	event, raw := mmTestPosted(tagged, "O", func(data *MMPostedData) {
+		data.Mentions = mmMustJSON([]string{mmTestBot})
+	})
+	if err := rig.connector.HandleEvent(context.Background(), event, raw, false); err != nil {
+		t.Fatal(err)
+	}
+	rig.api.threads["root1"] = MMPostList{Order: []string{"root1"}, Posts: map[string]MMPost{
+		"root1": {ID: "root1", CreateAt: 900, UserID: "u1", Message: "ordinary root"},
+	}}
+	later := mmTestPost(func(post *MMPost) { post.ID, post.RootID = "p3", "root1" })
+	event, raw = mmTestPosted(later, "O")
+	if err := rig.connector.HandleEvent(context.Background(), event, raw, false); err != nil {
+		t.Fatal(err)
+	}
+	if stored := mmTestFindEvent(t, rig.store, "p3"); stored == nil || stored.ConversationID != "c1:root1" {
+		t.Fatalf("later thread event = %#v", stored)
 	}
 }
 
@@ -563,6 +635,52 @@ func TestMMPostReplyThreaded(t *testing.T) {
 	defer rig.api.mu.Unlock()
 	if len(rig.api.posts) != 1 || rig.api.posts[0].ChannelID != "c2" || rig.api.posts[0].RootID != "root1" {
 		t.Fatalf("posts = %#v", rig.api.posts)
+	}
+}
+func TestMMDMReplyModeChoosesRootOrThread(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		post       MMPost
+		mode       string
+		wantRootID string
+	}{
+		{name: "new thread", post: mmTestPost(), mode: "thread", wantRootID: "p1"},
+		{name: "channel root", post: mmTestPost(func(post *MMPost) { post.ID, post.RootID = "p2", "root1" }), mode: "root"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rig := mmNewTestRig(t)
+			if test.post.RootID != "" {
+				rig.api.threads[test.post.RootID] = MMPostList{Order: []string{test.post.RootID}, Posts: map[string]MMPost{
+					test.post.RootID: {ID: test.post.RootID, UserID: "u1", CreateAt: 1},
+				}}
+			}
+			event, raw := mmTestPosted(test.post, "D")
+			if err := rig.connector.HandleEvent(context.Background(), event, raw, false); err != nil {
+				t.Fatal(err)
+			}
+			stored := mmTestFindEvent(t, rig.store, test.post.ID)
+			registry := NewRegistry()
+			if err := registry.Register(rig.connector); err != nil {
+				t.Fatal(err)
+			}
+			host, err := NewHostTools(HostToolsOptions{Store: rig.store, Connectors: registry, Now: func() int64 { return *rig.clock }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			delivery := mmTestDeliveryContext(t, rig.store, stored).Delivery
+			result, err := host.ChatReply(context.Background(), map[string]any{
+				"agent": mmTestTarget, "delivery_id": delivery.ID,
+				"conversation_id": stored.ConversationID, "message": "answer", "reply_mode": test.mode,
+			})
+			if err != nil || result.IsError {
+				t.Fatalf("ChatReply = %#v, %v", result, err)
+			}
+			rig.api.mu.Lock()
+			defer rig.api.mu.Unlock()
+			if len(rig.api.posts) != 1 || rig.api.posts[0].RootID != test.wantRootID {
+				t.Fatalf("posts = %#v", rig.api.posts)
+			}
+		})
 	}
 }
 

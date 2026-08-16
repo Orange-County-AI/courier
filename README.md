@@ -64,6 +64,11 @@ export MATTERMOST_URL=https://mattermost.example.com
 export MATTERMOST_BOT_TOKEN=...
 # optional: MATTERMOST_BOT_USER_ID, MATTERMOST_ATTACHMENT_DIR
 ```
+Channel mentions start or join a thread. Once mentioned, Courier durably follows
+that thread and delivers every later message so the agent can decide whether a
+reply is useful. For DMs, `chat_reply` can preserve the incoming location or set
+`reply_mode` to `root`/`thread`.
+
 
 **Gmail** (per-account polling via historyId):
 

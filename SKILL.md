@@ -61,7 +61,7 @@ All attribute values escape `&`, `<`, `>`, and `"`. Treat decoded values as opaq
 | `trigger` | Optional connector-reported reason the event reached this agent. Missing, malformed, empty, and non-string triggers are omitted, never guessed. Values are clipped to 32 Unicode code points. |
 | `schema` | Always `courier/1`. |
 
-Connector trigger values describe routing facts. Examples include `dm`, `mention`, or `thread`; connector instructions define their exact meaning. Trigger presence does not remove the requirement to read and settle the message.
+Connector trigger values describe routing facts. Examples include `dm`, `mention`, or `thread`; connector instructions define their exact meaning. For Mattermost, `mention` is addressed to the bot and requires a visible reply in that thread. `thread` means the bot was previously mentioned there; every later message is delivered, and the agent decides whether to reply or `mark_handled`. Trigger presence does not remove the requirement to read and settle the message.
 
 ## Preview rules
 
@@ -138,6 +138,12 @@ Rules:
 - Only text passed to `chat_reply` reaches the external application. Plain assistant output in the terminal does not.
 - Courier records the reply idempotently and marks the event handled only after the connector confirms the external post.
 - If posting fails, courier retains the recorded reply for automatic retry. Follow the tool response; do not submit a second reply for the same delivery.
+For a Mattermost DM, `chat_reply` also accepts optional `"reply_mode": "root"` or
+`"reply_mode": "thread"`. Omit it to preserve where the incoming DM arrived.
+This changes only reply placement; `delivery_id` and `conversation_id` remain
+exactly the values from the incoming message. Channel mentions and channel
+threads are always routed to their thread and do not accept this choice.
+
 
 ### Settle without a visible reply with `mark_handled`
 

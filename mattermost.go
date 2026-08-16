@@ -43,10 +43,12 @@ var mmMattermostTools = []ToolDef{{
 	},
 }}
 
-const mmMattermostInstructions = "Mattermost messages arrive with connector=\"mattermost\". Their conversation_id is the channel id, " +
-	"or `<channel_id>:<root_id>` for a message inside a thread — pass it back to chat_reply unchanged and " +
-	"the reply lands in the right thread; you never build it yourself. Use mattermost_history to read more " +
-	"of a conversation. There is no mattermost-specific mark-handled tool: mark_handled covers it."
+const mmMattermostInstructions = "Mattermost messages arrive with connector=\"mattermost\". In channels, an @mention must receive a visible " +
+	"chat_reply; Courier routes it into a thread rooted at the mentioned post. Once the bot is mentioned in a thread, every later message in " +
+	"that thread is delivered with trigger=\"thread\" whether or not it mentions the bot; use your judgment to chat_reply or mark_handled. " +
+	"Channel conversation_id values are `<channel_id>:<root_id>` and must still be passed back unchanged. In DMs, omit reply_mode to answer " +
+	"where the message arrived, or set chat_reply reply_mode to \"root\" or \"thread\" when one location better fits the exchange. " +
+	"Use mattermost_history to read more context. There is no Mattermost-specific mark-handled tool: mark_handled covers it."
 
 type mmSocket interface {
 	Read(context.Context) ([]byte, error)
@@ -223,11 +225,14 @@ func (m *MattermostConnector) ManifestTools() []ToolDef {
 
 func (m *MattermostConnector) Instructions() string { return mmMattermostInstructions }
 
-func MMConversationIDFor(post MMPost) string {
-	if MMInThread(post) {
-		return post.ChannelID + ":" + post.RootID
+func MMConversationIDFor(normalized MMNormalized) string {
+	if normalized.ChannelType != "D" {
+		return normalized.ChannelID + ":" + normalized.RootID
 	}
-	return post.ChannelID
+	if MMInThread(normalized.Post) {
+		return normalized.ChannelID + ":" + normalized.RootID
+	}
+	return normalized.ChannelID
 }
 
 func MMDecomposeConversationID(conversationID string) (channelID, rootID string) {
@@ -633,7 +638,7 @@ func (m *MattermostConnector) ingestPost(ctx context.Context, event MMEvent, raw
 	direct := parsed.IsDM || parsed.Mentioned
 	if direct {
 		parent := ""
-		if !parsed.IsDM && insideThread {
+		if !parsed.IsDM {
 			parent = parsed.RootID
 		}
 		m.startTyping(parsed.Post.ChannelID, parent)
@@ -643,7 +648,26 @@ func (m *MattermostConnector) ingestPost(ctx context.Context, event MMEvent, raw
 	for i, post := range prior {
 		participation[i] = MMPriorPost{IsBot: post.IsBot, Message: post.Message}
 	}
-	threadFollowed := insideThread && MMBotParticipates(participation, botUsername)
+	threadFollowed := false
+	if !parsed.IsDM && parsed.Mentioned {
+		if err := m.store.FollowMattermostThread(parsed.Post.ChannelID, parsed.RootID, m.now()); err != nil {
+			m.stopTyping(parsed.Post.ChannelID)
+			return err
+		}
+		threadFollowed = true
+	} else if !parsed.IsDM && insideThread {
+		var err error
+		threadFollowed, err = m.store.IsMattermostThreadFollowed(parsed.Post.ChannelID, parsed.RootID)
+		if err != nil {
+			return err
+		}
+		if !threadFollowed && MMBotParticipates(participation, botUsername) {
+			if err := m.store.FollowMattermostThread(parsed.Post.ChannelID, parsed.RootID, m.now()); err != nil {
+				return err
+			}
+			threadFollowed = true
+		}
+	}
 	normalized := NormalizeMMPost(event, botUserID, threadFollowed)
 	if normalized == nil {
 		if direct {
@@ -708,7 +732,27 @@ func (m *MattermostConnector) ingestEdit(ctx context.Context, event MMEvent, raw
 			trigger = MMTriggerDM
 		case MMMentions(post.Message, botUsername):
 			trigger = MMTriggerMention
-		case insideThread && MMBotParticipates(participation, botUsername):
+			rootID := post.RootID
+			if rootID == "" {
+				rootID = post.ID
+			}
+			if err := m.store.FollowMattermostThread(post.ChannelID, rootID, m.now()); err != nil {
+				return err
+			}
+		case insideThread:
+			followed, err := m.store.IsMattermostThreadFollowed(post.ChannelID, post.RootID)
+			if err != nil {
+				return err
+			}
+			if !followed && MMBotParticipates(participation, botUsername) {
+				if err := m.store.FollowMattermostThread(post.ChannelID, post.RootID, m.now()); err != nil {
+					return err
+				}
+				followed = true
+			}
+			if !followed {
+				return nil
+			}
 			trigger = MMTriggerThread
 		default:
 			return nil
@@ -779,7 +823,7 @@ func (m *MattermostConnector) ingestDelete(ctx context.Context, event MMEvent, r
 }
 
 func (m *MattermostConnector) queue(normalized MMNormalized, eventKey, raw, eventType string) (bool, error) {
-	conversationID := MMConversationIDFor(normalized.Post)
+	conversationID := MMConversationIDFor(normalized)
 	metaJSON, err := json.Marshal(normalized.Meta)
 	if err != nil {
 		return false, err
@@ -1098,6 +1142,35 @@ func (m *MattermostConnector) watchedChannels(ctx context.Context) ([]MMChannel,
 		channels = append(channels, channel)
 	}
 	return channels, nil
+}
+
+func (m *MattermostConnector) RouteReply(delivery DeliveryContext, mode string) (string, error) {
+	var meta map[string]string
+	if err := json.Unmarshal([]byte(delivery.Event.MetaJSON), &meta); err != nil {
+		return "", fmt.Errorf("Mattermost event %d has invalid meta_json: %w", delivery.Event.ID, err)
+	}
+	if meta["channel_type"] != "D" {
+		return "", errors.New("reply_mode is only available for Mattermost DMs")
+	}
+	channelID := meta["channel_id"]
+	if channelID == "" {
+		return "", errors.New("Mattermost DM metadata has no channel_id")
+	}
+	switch mode {
+	case "root":
+		return channelID, nil
+	case "thread":
+		rootID := meta["root_id"]
+		if rootID == "" {
+			rootID = meta["post_id"]
+		}
+		if rootID == "" {
+			return "", errors.New("Mattermost DM metadata has no post or thread root")
+		}
+		return channelID + ":" + rootID, nil
+	default:
+		return "", fmt.Errorf("unsupported Mattermost reply_mode %q", mode)
+	}
 }
 
 func (m *MattermostConnector) PostReply(ctx context.Context, delivery DeliveryContext, message string) error {

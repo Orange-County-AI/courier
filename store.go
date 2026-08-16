@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	SchemaVersion                = 1
+	SchemaVersion                = 2
 	DefaultRedeliverGraceMS      = int64(300_000)
 	DefaultRedeliverMaxBackoffMS = int64(1_800_000)
 	DefaultRedeliverReadFactor   = int64(4)
@@ -295,28 +295,40 @@ func (s *Store) migrate() error {
 }
 
 func (s *Store) step(tx *sql.Tx, version int) error {
-	if version != 1 {
+	switch version {
+	case 1:
+		cols, err := columns(tx, "deliveries")
+		if err != nil {
+			return fmt.Errorf("inspect deliveries columns: %w", err)
+		}
+		if !cols["read_at"] {
+			if _, err := tx.Exec("ALTER TABLE deliveries ADD COLUMN read_at INTEGER"); err != nil {
+				return fmt.Errorf("add deliveries.read_at: %w", err)
+			}
+			s.log("schema: added deliveries.read_at")
+		}
+		// session_generation originally arrived by editing CREATE TABLE. Healing old
+		// files here is why versioned migration exists: baseline edits reach only new files.
+		if !cols["session_generation"] {
+			if _, err := tx.Exec("ALTER TABLE deliveries ADD COLUMN session_generation INTEGER"); err != nil {
+				return fmt.Errorf("add deliveries.session_generation: %w", err)
+			}
+			s.log("schema: healed deliveries.session_generation (predates the CREATE-edit that added it)")
+		}
+		return nil
+	case 2:
+		if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS mattermost_threads (
+          channel_id TEXT NOT NULL,
+          root_id TEXT NOT NULL,
+          followed_at INTEGER NOT NULL,
+          PRIMARY KEY(channel_id, root_id)
+        )`); err != nil {
+			return fmt.Errorf("create mattermost_threads: %w", err)
+		}
+		return nil
+	default:
 		return fmt.Errorf("no migration step defined for schema version %d", version)
 	}
-	cols, err := columns(tx, "deliveries")
-	if err != nil {
-		return fmt.Errorf("inspect deliveries columns: %w", err)
-	}
-	if !cols["read_at"] {
-		if _, err := tx.Exec("ALTER TABLE deliveries ADD COLUMN read_at INTEGER"); err != nil {
-			return fmt.Errorf("add deliveries.read_at: %w", err)
-		}
-		s.log("schema: added deliveries.read_at")
-	}
-	// session_generation originally arrived by editing CREATE TABLE. Healing old
-	// files here is why versioned migration exists: baseline edits reach only new files.
-	if !cols["session_generation"] {
-		if _, err := tx.Exec("ALTER TABLE deliveries ADD COLUMN session_generation INTEGER"); err != nil {
-			return fmt.Errorf("add deliveries.session_generation: %w", err)
-		}
-		s.log("schema: healed deliveries.session_generation (predates the CREATE-edit that added it)")
-	}
-	return nil
 }
 
 var baselineStatements = []string{
@@ -388,6 +400,12 @@ var baselineStatements = []string{
         edit_at INTEGER NOT NULL DEFAULT 0,
         delete_at INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL
+      )`,
+	`CREATE TABLE IF NOT EXISTS mattermost_threads (
+        channel_id TEXT NOT NULL,
+        root_id TEXT NOT NULL,
+        followed_at INTEGER NOT NULL,
+        PRIMARY KEY(channel_id, root_id)
       )`,
 	`CREATE TABLE IF NOT EXISTS watermarks (
         account TEXT PRIMARY KEY,
@@ -1149,6 +1167,26 @@ func (s *Store) MarkPostDeleted(postID string, deleteAt, now int64) (bool, error
 	}
 	changed, err := result.RowsAffected()
 	return changed > 0, err
+}
+func (s *Store) FollowMattermostThread(channelID, rootID string, now int64) error {
+	_, err := s.db.Exec(`
+        INSERT INTO mattermost_threads (channel_id, root_id, followed_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(channel_id, root_id) DO NOTHING
+      `, channelID, rootID, now)
+	return err
+}
+
+func (s *Store) IsMattermostThreadFollowed(channelID, rootID string) (bool, error) {
+	var followed int
+	err := s.db.QueryRow(
+		"SELECT 1 FROM mattermost_threads WHERE channel_id = ? AND root_id = ?",
+		channelID, rootID,
+	).Scan(&followed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (s *Store) GetWatermark(account string) (*string, error) {

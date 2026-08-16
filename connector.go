@@ -41,6 +41,13 @@ type Connector interface {
 	Stop(ctx context.Context) error
 }
 
+// replyRouter is optional. Connectors implement it when chat_reply can choose
+// a transport-specific destination while keeping the incoming conversation_id
+// opaque and unchanged at the tool boundary.
+type replyRouter interface {
+	RouteReply(DeliveryContext, string) (string, error)
+}
+
 // unavailableNotifier is optional. A connector implements it only when its
 // transport has a user-visible way to explain that a durable delivery is
 // queued while the herdr target is unavailable.

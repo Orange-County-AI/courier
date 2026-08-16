@@ -161,7 +161,7 @@ func TestFreshDatabaseStartsAtCurrentSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := rawUserVersion(t, path); got != SchemaVersion {
-		t.Fatalf("user_version = %d, want 1", got)
+		t.Fatalf("user_version = %d, want %d", got, SchemaVersion)
 	}
 	columns := rawColumns(t, path, "deliveries")
 	for _, column := range []string{"session_generation", "read_at"} {
@@ -238,7 +238,7 @@ func TestV0DatabaseGainsColumnsKeepsRowsAndIsStamped(t *testing.T) {
 	if got := getTestDelivery(t, store, "d-1").ReadAt; got == nil || *got != 4242 {
 		t.Fatalf("read_at = %v", got)
 	}
-	if got := rawUserVersion(t, path); got != 1 {
+	if got := rawUserVersion(t, path); got != SchemaVersion {
 		t.Fatalf("migrated user_version = %d", got)
 	}
 }
@@ -303,7 +303,7 @@ func TestNewerDatabaseIsRefusedUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec("PRAGMA user_version = 2"); err != nil {
+	if _, err := raw.Exec("PRAGMA user_version = 3"); err != nil {
 		raw.Close()
 		t.Fatal(err)
 	}
@@ -313,10 +313,10 @@ func TestNewerDatabaseIsRefusedUntouched(t *testing.T) {
 	if store != nil {
 		store.Close()
 	}
-	if err == nil || !strings.Contains(err.Error(), "version 2") || !strings.Contains(err.Error(), "(1)") || !strings.Contains(err.Error(), "Refusing") {
+	if err == nil || !strings.Contains(err.Error(), "version 3") || !strings.Contains(err.Error(), "(2)") || !strings.Contains(err.Error(), "Refusing") {
 		t.Fatalf("Open newer database error = %v", err)
 	}
-	if got := rawUserVersion(t, path); got != 2 {
+	if got := rawUserVersion(t, path); got != 3 {
 		t.Fatalf("refusal changed user_version to %d", got)
 	}
 	if after := rawSchema(t, path); !reflect.DeepEqual(before, after) {
@@ -334,7 +334,7 @@ func TestMigrationLogsOnlyUpgrade(t *testing.T) {
 	store.Close()
 	joined := strings.Join(upgrade, "\n")
 	for _, fragment := range []string{
-		"migrating database from version 0 to 1",
+		"migrating database from version 0 to 2",
 		"added deliveries.read_at",
 		"healed deliveries.session_generation",
 	} {
@@ -367,7 +367,7 @@ func TestCurrentTypeScriptSchemaOpensWithZeroSteps(t *testing.T) {
 	if len(logs) != 0 {
 		t.Fatalf("TS current schema ran migration steps: %v", logs)
 	}
-	if got := rawUserVersion(t, path); got != 1 {
+	if got := rawUserVersion(t, path); got != SchemaVersion {
 		t.Fatalf("user_version = %d", got)
 	}
 	if after := rawSchema(t, path); !reflect.DeepEqual(before, after) {

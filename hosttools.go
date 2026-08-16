@@ -31,13 +31,18 @@ var HostToolDefs = []ToolDef{
 		Description: "Send your visible response back to the chat application. A human may be reading your terminal, but " +
 			"only what you pass to this tool reaches the sender — your plain assistant text does not. Call it at " +
 			"most once for each <msg>, passing that message's delivery_id and conversation_id back unchanged. " +
-			"A message that warrants no reply is finished with mark_handled instead.",
+			"For a Mattermost DM only, optional reply_mode chooses the channel root or a thread. A message that " +
+			"warrants no reply is finished with mark_handled instead.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"delivery_id":     map[string]any{"type": "string", "description": "The delivery_id from the incoming <msg>."},
 				"conversation_id": map[string]any{"type": "string", "description": "The conversation_id from the incoming <msg>."},
 				"message":         map[string]any{"type": "string", "description": "The natural-language reply visible to the user."},
+				"reply_mode": map[string]any{
+					"type": "string", "enum": []string{"root", "thread"},
+					"description": "Mattermost DMs only: reply at the DM channel root, or in the incoming/new message thread. Omit to preserve where the message arrived.",
+				},
 			},
 			"required": []string{"delivery_id", "conversation_id", "message"},
 		},
@@ -216,7 +221,7 @@ func (h *HostTools) postAndComplete(ctx context.Context, replyID string) (postOu
 		postErr = connector.PostReply(ctx, DeliveryContext{
 			Delivery:       *delivery,
 			Event:          *event,
-			ConversationID: event.ConversationID,
+			ConversationID: reply.ConversationID,
 		}, reply.Message)
 	}
 	if postErr != nil {
@@ -250,6 +255,7 @@ func (h *HostTools) ChatReply(ctx context.Context, args map[string]any) (ToolRes
 	deliveryID := stringArg(args["delivery_id"])
 	conversationID := stringArg(args["conversation_id"])
 	message := stringArg(args["message"])
+	replyMode := stringArg(args["reply_mode"])
 	if agent == "" {
 		return ToolResult{Text: "agent is required — the MCP shim supplies it from CHANNEL_AGENT", IsError: true, Status: 400}, nil
 	}
@@ -281,11 +287,32 @@ func (h *HostTools) ChatReply(ctx context.Context, args map[string]any) (ToolRes
 	if event.ConversationID != conversationID {
 		return ToolResult{Text: "conversation_id does not match delivery " + deliveryID, IsError: true, Status: 409}, nil
 	}
+	effectiveConversationID := conversationID
+	if replyMode != "" {
+		connector, err := h.connectors.Require(event.Connector)
+		if err != nil {
+			return ToolResult{}, err
+		}
+		router, ok := connector.(replyRouter)
+		if !ok {
+			return ToolResult{
+				Text:    fmt.Sprintf("reply_mode is not supported by connector %s", event.Connector),
+				IsError: true,
+				Status:  400,
+			}, nil
+		}
+		effectiveConversationID, err = router.RouteReply(DeliveryContext{
+			Delivery: *delivery, Event: *event, ConversationID: conversationID,
+		}, replyMode)
+		if err != nil {
+			return ToolResult{Text: err.Error(), IsError: true, Status: 400}, nil
+		}
+	}
 
 	reply, duplicate, err := h.store.InsertReply(ReplyInsert{
 		DeliveryID:     deliveryID,
 		Target:         agent,
-		ConversationID: conversationID,
+		ConversationID: effectiveConversationID,
 		Message:        message,
 	}, h.now())
 	if err != nil {
