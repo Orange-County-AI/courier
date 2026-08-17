@@ -91,7 +91,7 @@ func inboxTogglePause(ctx context.Context, opts clientOptions, inbox clientInbox
 func inboxRender(out io.Writer, inbox clientInbox, status string) {
 	width := inboxWidth(out)
 	fmt.Fprint(out, inboxClearScreen)
-	fmt.Fprintln(out, inboxHeader(inbox))
+	fmt.Fprintln(out, inboxClip(inboxHeader(inbox), width))
 	fmt.Fprintln(out)
 	if len(inbox.Rows) == 0 {
 		fmt.Fprintln(out, "no messages waiting")
@@ -115,8 +115,8 @@ func inboxRender(out io.Writer, inbox clientInbox, status string) {
 		}
 	}
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, status)
-	fmt.Fprintln(out, "[enter] refresh   [d] deliver now   [p] pause/resume   [q] quit")
+	fmt.Fprintln(out, inboxClip(status, width))
+	fmt.Fprintln(out, inboxClip("[enter] refresh   [d] deliver now   [p] pause/resume   [q] quit", width))
 }
 
 func inboxHeader(inbox clientInbox) string {
