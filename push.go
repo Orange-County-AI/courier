@@ -25,6 +25,8 @@ const pushUsage = `usage: courier push --source NAME [flags]
   --user NAME            upstream display identity
   --trigger WORD         routing reason, e.g. mention or alert
   --meta KEY=VALUE       repeatable structured fact
+  --reply-url URL        per-event reply endpoint; honoured only when the operator
+                         declared a matching reply_url_prefixes entry for NAME
   --url URL              ingest base URL; defaults to COURIER_INGEST_URL, then
                          http://127.0.0.1:$COURIER_INGEST_LISTEN_PORT
 
@@ -40,6 +42,7 @@ type pushArgs struct {
 	user         string
 	trigger      string
 	url          string
+	replyURL     string
 	meta         map[string]string
 }
 
@@ -87,6 +90,7 @@ func runPush(args []string, stdout io.Writer) error {
 		User:           parsed.user,
 		Trigger:        parsed.trigger,
 		Content:        parsed.content,
+		ReplyURL:       parsed.replyURL,
 		Meta:           parsed.meta,
 	})
 	if err != nil {
@@ -139,7 +143,7 @@ func parsePushArgs(args []string) (pushArgs, error) {
 		var value string
 		var err error
 		switch name {
-		case "--source", "--content", "--conversation", "--event-key", "--user", "--trigger", "--url", "--meta":
+		case "--source", "--content", "--conversation", "--event-key", "--user", "--trigger", "--url", "--reply-url", "--meta":
 			value, err = valueOf()
 		default:
 			return pushArgs{}, fmt.Errorf("unknown push flag %q\n%s", flag, pushUsage)
@@ -163,6 +167,8 @@ func parsePushArgs(args []string) (pushArgs, error) {
 			parsed.trigger = strings.TrimSpace(value)
 		case "--url":
 			parsed.url = strings.TrimSpace(value)
+		case "--reply-url":
+			parsed.replyURL = strings.TrimSpace(value)
 		case "--meta":
 			key, metaValue, ok := strings.Cut(value, "=")
 			key = strings.TrimSpace(key)

@@ -15,16 +15,27 @@ Two roles:
   POSTs the agent's answer to. A source without one is *one-way*: courier tells the agent
   that answers are impossible, and the agent settles without replying.
 
-```text
-   your integration                    courier serve                    agent pane
- ─────────────────────      ───────────────────────────────      ─────────────────────
-  POST /ingest/{source}  ──▶  verify → ledger row (durable)
-        202 queued       ◀──                │
-                                            ├─ dispatch ──▶  <msg delivery_id=… >
-                                            │                        │
-                                            │                  read_message
-  POST {reply_url}       ◀──  chat_reply  ◀─┴───────────────  chat_reply / mark_handled
-        2xx = delivered  ──▶  settle (never redelivered again)
+```mermaid
+sequenceDiagram
+    participant sender as your integration
+    participant courier as courier serve
+    participant pane as agent pane
+
+    sender->>courier: signed POST /ingest/{source}
+    courier->>courier: durable ledger write (EVENT, then DELIVERY)
+    courier-->>sender: 202 queued
+    courier->>pane: msg pointer (courier/1)
+    pane->>courier: read_message
+    alt a reply serves the sender
+        pane->>courier: chat_reply, recorded before anything is posted
+        courier->>sender: signed POST to reply_url
+        sender-->>courier: 2xx, only after the reply is durably yours
+        courier->>courier: delivery settled permanently
+    else no reply is warranted
+        pane->>courier: mark_handled
+        courier->>courier: delivery settled permanently
+    end
+    note over sender,courier: a non-2xx or a timeout keeps the reply and retries it — the agent is never asked twice
 ```
 
 ## 1. What courier guarantees a sender
@@ -169,6 +180,7 @@ courier push --source demo --conversation demo:1 --content 'hello from my integr
 | `content` | yes | string | 1–65536 bytes. The **whole** text the agent reads. Not a summary, not a title. |
 | `user` | no | string | ≤ 200 characters. Upstream display identity. Clipped to 64 code points in the pointer the agent first sees; missing becomes `unknown`. |
 | `trigger` | no | string | ≤ 32 code points. Why this reached the agent, e.g. `mention`, `alert`, `assigned`, `review`. Surfaced verbatim as the `trigger` attribute. |
+| `reply_url` | no | string | ≤ 2048 characters, `http` or `https`, no userinfo. Where **this event's** answer is POSTed. Honoured ONLY when it begins with one of the `reply_url_prefixes` the operator declared for the source (§7); otherwise `400`. Absent means the source's own `reply_url` is used. |
 | `meta` | no | object | ≤ 32 entries; keys ≤ 64 characters, **string** values ≤ 1024 characters. Structured facts the agent can use — ids, URLs, labels. A non-string value is `400`. The key `trigger` is reserved and is `400`; use the top-level field. |
 
 Content rules a sender SHOULD follow, because the agent cannot recover what you leave out:
@@ -194,7 +206,7 @@ Every response is JSON. Senders MUST branch on the HTTP status, not on prose.
 |---|---|---|---|
 | `202` | `queued` | Committed to the ledger; a delivery exists. | Success. Do not resend. |
 | `200` | `duplicate` | This `event_key` was already ingested for this source. | Success. Do not resend. |
-| `400` | `rejected` | Malformed JSON, wrong `schema`, missing or oversized field, non-string `meta` value, reserved `meta.trigger`. | Fix the payload. Retrying unchanged cannot succeed. |
+| `400` | `rejected` | Malformed JSON, wrong `schema`, missing or oversized field, non-string `meta` value, reserved `meta.trigger`, or a `reply_url` the source's `reply_url_prefixes` do not allow. | Fix the payload. Retrying unchanged cannot succeed. |
 | `401` | `rejected` | Missing, malformed or wrong signature, or a timestamp outside the 300 s window. | Fix clock or secret. Do not retry unchanged. |
 | `404` | `rejected` | No such source is configured. | Operator must declare the source. |
 | `413` | `rejected` | Body over 256 KiB. | Shrink `content`; link to the rest. |
@@ -229,6 +241,12 @@ self-service, so an integration cannot grant itself an agent's attention.
     "source": "buildbot",
     "secret": "…",
     "instructions": "Build failures are one-way notifications: investigate, then mark_handled."
+  },
+  {
+    "source": "ci",
+    "secret": "…",
+    "reply_url_prefixes": ["https://ci.example.com/courier/"],
+    "instructions": "Each run POSTs its own reply_url; the answer goes back to that run."
   }
 ]
 ```
@@ -237,7 +255,8 @@ self-service, so an integration cannot grant itself an agent's attention.
 |---|---|---|
 | `source` | yes | `^[a-z][a-z0-9_-]{0,31}$`. Becomes the `connector` attribute the agent sees. MUST NOT collide with a built-in connector (`mattermost`, `gmail`, `telegram`, `kaneo`) or another source; courier refuses to boot on a collision. |
 | `secret` | yes | ≥ 16 bytes. |
-| `reply_url` | no | `http` or `https` URL. Absent means the source is one-way (§9). |
+| `reply_url` | no | `http` or `https` URL, no userinfo. The source's default destination. Absent, with no `reply_url_prefixes`, means the source is one-way (§9). |
+| `reply_url_prefixes` | no | Array of `http`/`https` prefixes, each ending in `/`, with no query or fragment. The ONLY way a sender-supplied per-event `reply_url` is honoured: it must begin with one of these literal strings. The trailing slash is required so `…/courier/` cannot also authorize `…/courier-evil`. |
 | `instructions` | no | ≤ 4000 characters, appended to the agent's MCP manifest instructions verbatim. This is where you tell the agent what a reply to your system *does*. |
 
 Environment:
@@ -253,8 +272,9 @@ same way it names built-ins, and `GET /health` lists them individually.
 
 ## 8. Reply callback
 
-When the agent calls `chat_reply` for a delivery from your source, courier POSTs to the
-source's `reply_url`:
+When the agent calls `chat_reply` for a delivery from your source, courier POSTs to that
+delivery's destination — the event's own `reply_url` when it carried one the operator's
+`reply_url_prefixes` allow, otherwise the source's `reply_url`:
 
 ```text
 POST {reply_url}
@@ -296,15 +316,20 @@ wrong:
   second `chat_reply` from the agent is refused as a duplicate. Failure is therefore safe:
   slow and honest beats fast and optimistic.
 - The response body is ignored (read and discarded).
-- The callback URL comes from operator configuration only. A sender MUST NOT expect a
-  per-event `reply_url` field to be honoured; courier ignores one. An agent-triggered POST
-  to a sender-chosen URL would make courier a request forwarder for whoever can sign an
-  event, and that is a capability, not a convenience.
+- **The destination is bounded by operator configuration, always.** A sender may name a
+  per-event `reply_url`, but only inside a prefix the operator declared (§7); anything else
+  is `400` at ingest. Courier re-checks the prefix at posting time, so revoking a prefix
+  takes effect for replies not yet posted, and it **never follows a redirect** — a `302`
+  would move the POST off the declared destination, which is the hop the prefix exists to
+  prevent.
+- Without a declared prefix, a sender-supplied `reply_url` is refused rather than ignored:
+  silently posting somewhere else is worse than telling the sender it is not allowed.
 
 ## 9. One-way sources
 
-A source with no `reply_url` accepts events and cannot receive answers. Courier makes that
-explicit rather than failing later:
+A source that resolves to no destination — no `reply_url`, and either no
+`reply_url_prefixes` or an event that carried no permitted URL — accepts events and cannot
+receive answers. Courier makes that explicit rather than failing later:
 
 - `chat_reply` for such a delivery is **refused at the tool boundary** with a message
   naming the source and telling the agent to `mark_handled`. Nothing is recorded, so
@@ -318,8 +343,15 @@ explicit rather than failing later:
 
 - **Loopback plus HMAC.** Reaching the port is not authorization; every ingest is
   authenticated per source. Conversely, a valid signature is authorization to *queue a
-  message for one agent* and nothing else: there is no tool call, no shell, no path, and no
-  reply routing in the wire format.
+  message for one agent* and nothing else: there is no tool call, no shell and no path in
+  the wire format, and the only routing it can express is a URL the operator pre-approved.
+- **Sender-chosen reply destinations are a capability, not a convenience.** Courier runs
+  where the sender cannot reach: its own IPC on `127.0.0.1:8788` is unauthenticated by
+  design, a cloud metadata service answers on `169.254.169.254`, and every other loopback
+  daemon on that host is one hostname away. A `reply_url` courier honoured without checking
+  would make courier a confused deputy — POSTing agent-authored text, signed, to anywhere
+  the holder of one source secret names. Hence the prefix allowlist, the re-check at posting
+  time, and the refusal to follow redirects.
 - **Per-source secrets isolate senders.** One integration's secret cannot forge another
   source's events, because the secret is selected by the `{source}` in the path.
 - **Replay is bounded** by the 300-second timestamp window, and a replay inside it is
@@ -339,7 +371,8 @@ Named explicitly so nobody writes to a field that does not exist:
 - **Attachments.** Courier's attachment paths are files on the courier host; a remote
   sender cannot produce one. Link to your files in `content` or `meta`.
 - **Binary or non-JSON bodies.**
-- **Per-event reply routing.** §8.
+- **Unbounded per-event reply routing.** A per-event `reply_url` works only inside an
+  operator-declared prefix; there is no way for a sender to widen it. §8, §10.
 - **Pull-based reply retrieval.** A receiver endpoint is the only reply transport; there is
   no `GET /outbox`.
 - **Sender-visible delivery status.** §6.
@@ -361,3 +394,6 @@ An integration conforms when all of these hold. `courier push` (§4) exercises 1
    `delivery_id`, and returns 2xx **only** after the reply is durably delivered.
 6. If it does not accept replies: it declares no `reply_url`, and its `instructions` tell
    the agent what to do instead.
+7. If it routes replies per event: every `reply_url` it sends sits inside a prefix the
+   operator declared, and it treats a `400` naming the prefixes as a configuration task, not
+   something to retry or work around.

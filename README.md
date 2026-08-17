@@ -15,37 +15,48 @@ Supported connectors: **Mattermost**, **Gmail**, **Telegram**, and **Kaneo** (we
 
 ### The shape of the system
 
-```text
-┌─────────────────────────── external applications ──────────────────────────┐
-│  Mattermost (websocket)   Gmail (historyId poll)   Telegram / Kaneo        │
-│                          (webhooks, loopback listener)                     │
-│  your integration: signed HTTP, POST /ingest/{source}  (courier.ingest/1)  │
-└──────────────────────────────────┬─────────────────────────────────────────┘
-                                   ▼  push or pull, per connector
-┌─────────────────────────────── courier serve ──────────────────────────────┐
-│                                                                            │
-│   connectors ──normalize──▶ EVENTS ──▶ DELIVERIES ────▶ dispatcher         │
-│        ▲                   (deduped by   (one open         │ claim oldest  │
-│        │                    connector +   delivery per      │ on each tick │
-│        │                    event_key)    event, addressed  ▼              │
-│        │                                  to the target)   envelope       │
-│   PostReply ◀── replies ◀──────────────  `courier/1` <msg …>              │
-│        │                                   (bounded pointer)  │            │
-└────────┼─────────────────────────────────────────────────────┼────────────┘
-         │ reply posted back                                herdr socket API
-         │                                                        │
-         │                                                        ▼
-         │                                          ┌───────────────────────┐
-         │                                          │ agent pane            │
-         │                                          │ label = COURIER_TARGET│
-         │      ┌─────────────────────┐              │ ┌───────────────────┐ │
-         └──────│ courier mcp (stdio) │◀── MCP ──────┼─│ read_message      │ │
-                │ shim, one per       │   tools      │ │ chat_reply        │ │
-                │ agent session       │              │ │ mark_handled      │ │
-                └──────────┬──────────┘              │ └───────────────────┘ │
-                           │ POST /tool/{name}       └───────────────────────┘
-                           ▼
-                    daemon IPC (127.0.0.1:8788 or unix socket)
+```mermaid
+flowchart TB
+    subgraph external["external applications"]
+        mattermost["Mattermost (websocket)"]
+        gmail["Gmail (historyId poll)"]
+        telegram["Telegram / Kaneo (webhooks, loopback listener)"]
+        integration["your integration (courier.ingest/1: signed POST /ingest/{source})"]
+    end
+
+    subgraph daemon["courier serve"]
+        connectors["connectors (push or pull, per connector)"]
+        events["EVENTS (deduped by connector + event_key)"]
+        deliveries["DELIVERIES (one open delivery per event, addressed to the target)"]
+        dispatcher["dispatcher (claims the oldest on each tick)"]
+        ipc["daemon IPC (127.0.0.1:8788 or unix socket)"]
+        postreply["PostReply (only chat_reply text leaves courier)"]
+    end
+
+    subgraph pane["agent pane (label = COURIER_TARGET)"]
+        msg["msg pointer (courier/1, bounded)"]
+        read["read_message"]
+        reply["chat_reply"]
+        handled["mark_handled"]
+    end
+
+    shim["courier mcp (stdio shim, one per agent session)"]
+
+    mattermost --> connectors
+    gmail --> connectors
+    telegram --> connectors
+    integration --> connectors
+    connectors -->|"normalize"| events
+    events --> deliveries
+    deliveries --> dispatcher
+    dispatcher -->|"herdr socket API"| msg
+    msg --> read
+    read --> shim
+    reply --> shim
+    handled --> shim
+    shim -->|"POST /tool/{name}"| ipc
+    ipc -->|"chat_reply"| postreply
+    postreply -->|"reply posted to the conversation it came from"| external
 ```
 
 Inbound: a connector normalizes the external event into a ledger row; the dispatcher
@@ -59,24 +70,20 @@ external application — the terminal the agent types in is not a channel.
 Agents never register themselves at runtime. Ownership is declared once, daemon-side,
 and enforced on every call:
 
-```text
- provision time ─▶ reconciler_state row (one per org):
-                     pane_label = COURIER_TARGET, agent kind, pane id,
-                     native session id, session generation
-
- daemon startup ─▶ Reconcile: resolve the label in herdr
-                     ├─ present ────────────▶ refresh state
-                     ├─ label lost (restart)▶ relabel the restored agent by
-                     │                         session ▸ session-prefix
-                     │                         (ambiguous matches refuse; a bare
-                     │                          pane id is an address, not an
-                     │                          identity, and never adopts)
-                     └─ absent ─────────────▶ start it in the recorded pane,
-                                              resume preferred over fresh
-
- every tool call ─▶ the shim pins agent = COURIER_AGENT (the model cannot
-                     supply its own); a delivery owned by another agent
-                     gets 409 before anything is written
+```mermaid
+flowchart TB
+    provision["provision time"] --> state["reconciler_state row (one per org): pane_label = COURIER_TARGET; agent kind; pane id; native session id; session generation"]
+    startup["daemon startup"] --> reconcile["Reconcile: resolve the recorded label in herdr"]
+    state -. "the only ownership record" .-> reconcile
+    reconcile -->|"present"| refresh["refresh state"]
+    reconcile -->|"label lost (restart)"| relabel["relabel the restored agent by session, then session-prefix"]
+    relabel -->|"one match"| refresh
+    relabel -->|"ambiguous"| refuse["refuse: a bare pane id is an address, never an identity"]
+    reconcile -->|"absent"| start["start it in the recorded pane; resume preferred over fresh"]
+    reconcile -->|"no row for this org"| unavailable["unavailable: the org was never provisioned, so no prompt is attempted"]
+    toolcall["every tool call"] --> pin["shim pins agent = COURIER_AGENT (the model cannot supply its own)"]
+    pin -->|"owned by this agent"| proceed["the tool runs"]
+    pin -->|"owned by another agent"| denied["409 before anything is written"]
 ```
 
 `COURIER_ORG` selects the ledger (and thus the reconciler_state row); `COURIER_TARGET`
@@ -88,31 +95,34 @@ guessing, and no prompt is attempted.
 
 There are two acknowledgements, and only the second one settles anything:
 
-```text
- ingest ─▶ EVENT ─▶ DELIVERY [pending]
-                         │
-        dispatcher tick: claim oldest ──▶ [dispatched] ──▶ <msg> prompt
-              ▲                                │
-              │                                ├─ prompt failed ─▶ back to
-              │                                │   [pending] + reconcile
-              │                                │   (target unavailable may
-              │                                │   also notify the channel)
-              │                                │
-              │  sweep: dispatched older than  │  a *successful* prompt is
-              │  backoff re-queues as pending  │  still NOT settlement —
-              │  backoff = min(grace×(read?4:1)│  only tools settle:
-              │            ×2^attempts, cap)  │
-              │                                ▼
-              │        read_message ─▶ stamps read_at once (receipt; slows
-              │                        the next backoff by the read factor)
-              │                                │
-              │        chat_reply ─▶ [replied] ─▶ PostReply to the app
-              │                          │         ├─ confirmed ─▶ [handled]
-              │                          │         └─ failed ─▶ post_error kept;
-              │                          │                     RetryPosts retries
-              │                          │                     every tick
-              │        mark_handled ──────────────▶ [handled]
+```mermaid
+stateDiagram-v2
+    [*] --> pending: ingest writes EVENT, then DELIVERY
+    pending --> dispatched: tick claims the oldest, then prompts
+    dispatched --> pending: prompt failed, plus reconcile
+    dispatched --> pending: sweep re-queues after the backoff
+    dispatched --> dispatched: read_message stamps read_at once
+    dispatched --> replied: chat_reply recorded
+    replied --> handled: post confirmed by the app
+    replied --> replied: post failed, RetryPosts retries
+    dispatched --> handled: mark_handled
+    handled --> [*]
+
+    note right of dispatched
+        A successful prompt is NOT settlement
+    end note
 ```
+
+What the transitions leave out:
+
+- `backoff = min(grace × (read ? read_factor : 1) × 2^attempts, cap)`, so a delivery the
+  agent read but never settled comes back more slowly than one it never touched.
+- `read_message` stamps `read_at` once. It is a receipt, not settlement; its only other
+  effect is that read factor on the next backoff.
+- A prompt that fails also triggers reconcile, and an unavailable target may additionally
+  notify the channel the message came from.
+- A failed post keeps `post_error` on the reply row and stays `replied`; `RetryPosts` owns
+  it from then on, once per tick.
 
 Settlement writes `handled_at` through exactly one store path, shared by the confirmed
 post and `mark_handled`. Until then the delivery is redelivered forever with growing
@@ -301,11 +311,21 @@ The sources value is a JSON array of declarations:
     "secret": "…",
     "reply_url": "http://127.0.0.1:9114/courier/reply",
     "instructions": "Sentry alerts arrive with connector=\"sentry\"."
+  },
+  {
+    "source": "ci",
+    "secret": "…",
+    "reply_url_prefixes": ["https://ci.example.com/courier/"],
+    "instructions": "Each run POSTs its own reply_url; the answer goes back to that run."
   }
 ]
 ```
 
-Each declared source becomes its own connector, so `COURIER_CONNECTORS` names it like a built-in and the agent sees `connector="<source>"`. A source without `reply_url` is one-way; `chat_reply` is refused for it and the agent must use `mark_handled` instead. The listener is loopback-only, so front it with your own tunnel or TLS-terminating reverse proxy. See the [wire spec](./spec/ingest-1.md) for source declarations and wire details.
+Each declared source becomes its own connector, so `COURIER_CONNECTORS` names it like a built-in and the agent sees `connector="<source>"`. A source with neither `reply_url` nor a usable `reply_url_prefixes` match is one-way: `chat_reply` is refused at the tool boundary and the agent settles with `mark_handled` instead.
+
+A sender may route its own answer with a per-event `reply_url`, but only inside a prefix declared here — courier re-checks it when it posts and never follows a redirect. Unbounded sender-chosen destinations would make courier post signed, agent-authored text anywhere the holder of one source secret named, including its own unauthenticated IPC on 127.0.0.1:8788 and the cloud metadata service.
+
+The listener is loopback-only, so front it with your own tunnel or TLS-terminating reverse proxy. See the [wire spec](./spec/ingest-1.md) for the request/response contract and every limit.
 
 Secrets belong in environment injection, never command arguments.
 

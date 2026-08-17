@@ -686,3 +686,228 @@ func TestPushResolveSecretAndURL(t *testing.T) {
 		t.Fatal("URL resolution succeeded without a URL or port")
 	}
 }
+
+func ingestPrefixSource(name string, prefixes ...string) IngestSource {
+	return IngestSource{Source: name, Secret: ingestTestSecret, ReplyURLPrefixes: prefixes}
+}
+
+// A per-event reply endpoint is a capability, so the whole point of the feature
+// is which URLs it REFUSES. The loopback case is the sharp one: courier's own IPC
+// is unauthenticated and reachable from where courier runs, so a sender that
+// could name it would settle deliveries courier never posted.
+func TestIngestPerEventReplyURLRequiresDeclaredPrefix(t *testing.T) {
+	tests := []struct {
+		name     string
+		source   IngestSource
+		replyURL string
+		status   int
+	}{
+		{
+			name:     "inside the declared prefix",
+			source:   ingestPrefixSource("runs", "https://ci.test/courier/"),
+			replyURL: "https://ci.test/courier/run/4182",
+			status:   http.StatusAccepted,
+		},
+		{
+			name:     "no prefixes declared",
+			source:   ingestTestSource("runs"),
+			replyURL: "https://ci.test/courier/run/4182",
+			status:   http.StatusBadRequest,
+		},
+		{
+			name:     "different host",
+			source:   ingestPrefixSource("runs", "https://ci.test/courier/"),
+			replyURL: "https://evil.test/courier/run/4182",
+			status:   http.StatusBadRequest,
+		},
+		{
+			name:     "sibling path outside the boundary",
+			source:   ingestPrefixSource("runs", "https://ci.test/courier/"),
+			replyURL: "https://ci.test/courier-evil/run",
+			status:   http.StatusBadRequest,
+		},
+		{
+			name:     "courier's own loopback IPC",
+			source:   ingestPrefixSource("runs", "https://ci.test/courier/"),
+			replyURL: "http://127.0.0.1:8788/tool/mark_handled",
+			status:   http.StatusBadRequest,
+		},
+		{
+			name:     "cloud metadata service",
+			source:   ingestPrefixSource("runs", "https://ci.test/courier/"),
+			replyURL: "http://169.254.169.254/latest/meta-data/",
+			status:   http.StatusBadRequest,
+		},
+		{
+			name:     "not a URL courier could post to",
+			source:   ingestPrefixSource("runs", "https://ci.test/courier/"),
+			replyURL: "file:///etc/passwd",
+			status:   http.StatusBadRequest,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, host, _ := newIngestTestHost(t, test.source)
+			body := ingestTestBody(map[string]any{
+				"schema": IngestSchema, "event_key": "routed", "conversation_id": "conversation-1",
+				"content": "x", "reply_url": test.replyURL,
+			})
+			response := serveIngestRequest(host, signedIngestRequest(test.source.Source, body, ingestTestNow/1000, ingestTestSecret))
+			wantEvents := int64(0)
+			if test.status == http.StatusAccepted {
+				wantEvents = 1
+			}
+			if response.Code != test.status || ingestStoredCount(t, store) != wantEvents {
+				t.Fatalf("response = %d (want %d), events = %d: %s", response.Code, test.status, ingestStoredCount(t, store), response.Body.String())
+			}
+		})
+	}
+}
+
+func TestIngestPostsToPerEventReplyURL(t *testing.T) {
+	var posted string
+	store, host, connectors := newIngestTestHost(t, IngestSource{
+		Source: "runs", Secret: ingestTestSecret,
+		ReplyURL:         "https://ci.test/courier/default",
+		ReplyURLPrefixes: []string{"https://ci.test/courier/"},
+	})
+	host.client = ingestTestClient(func(request *http.Request) (*http.Response, error) {
+		posted = request.URL.String()
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok"))}, nil
+	})
+	body := ingestTestBody(map[string]any{
+		"schema": IngestSchema, "event_key": "routed", "conversation_id": "conversation-1",
+		"content": "x", "reply_url": "https://ci.test/courier/run/4182",
+	})
+	if response := serveIngestRequest(host, signedIngestRequest("runs", body, ingestTestNow/1000, ingestTestSecret)); response.Code != http.StatusAccepted {
+		t.Fatalf("ingest = %d: %s", response.Code, response.Body.String())
+	}
+	event, err := store.FindEvent("runs", "routed")
+	if err != nil || event == nil {
+		t.Fatalf("FindEvent = %#v, %v", event, err)
+	}
+	delivery, err := store.OpenDeliveryForEvent(event.ID)
+	if err != nil || delivery == nil {
+		t.Fatalf("OpenDeliveryForEvent = %#v, %v", delivery, err)
+	}
+	dc := DeliveryContext{Delivery: *delivery, Event: *event, ConversationID: event.ConversationID}
+	if refusal := connectors[0].RefuseReply(dc); refusal != "" {
+		t.Fatalf("refusal for an allowed per-event URL = %q", refusal)
+	}
+	if err := connectors[0].PostReply(context.Background(), dc, "answered"); err != nil {
+		t.Fatal(err)
+	}
+	// The event's own endpoint, not the source default: a per-run receiver that
+	// got the source default would post the answer into the wrong run.
+	if posted != "https://ci.test/courier/run/4182" {
+		t.Fatalf("posted to %q", posted)
+	}
+}
+
+// Config at posting time is the authority. A URL that was allowed when the event
+// arrived, but is outside the prefixes now, must not be posted to — and must not
+// leave the answer circling in RetryPosts either.
+func TestIngestReplyRefusedWhenRoutingNoLongerAllowed(t *testing.T) {
+	_, _, connectors := newIngestTestHost(t,
+		ingestPrefixSource("runs", "https://ci.test/courier/"),
+		ingestPrefixSource("empty", "https://ci.test/courier/"),
+	)
+	revoked := Event{
+		Connector: "runs", EventKey: "routed", ConversationID: "conversation-1",
+		RawJSON: `{"schema":"courier.ingest/1","event_key":"routed","conversation_id":"conversation-1","content":"x","reply_url":"https://was-allowed.test/courier/run/1"}`,
+	}
+	refusal := connectors[0].RefuseReply(DeliveryContext{Event: revoked})
+	if !strings.Contains(refusal, "mark_handled") || !strings.Contains(refusal, "reply_url_prefixes") {
+		t.Fatalf("refusal for a revoked destination = %q", refusal)
+	}
+	if err := connectors[0].PostReply(context.Background(), DeliveryContext{Event: revoked}, "answer"); err == nil {
+		t.Fatal("PostReply accepted a destination outside the declared prefixes")
+	}
+	// Prefixes without a source default: an event that carried no reply_url has
+	// nowhere to go, so it is one-way for that message alone.
+	noDestination := Event{Connector: "empty", EventKey: "plain", RawJSON: string(ingestValidBody("plain"))}
+	if refusal := connectors[1].RefuseReply(DeliveryContext{Event: noDestination}); !strings.Contains(refusal, "accepts no replies") {
+		t.Fatalf("refusal for an event with no destination = %q", refusal)
+	}
+}
+
+// A 302 moves the POST off the URL the operator declared, which is the hop the
+// allowlist exists to prevent, so the default client must refuse rather than
+// chase it.
+func TestIngestReplyClientRefusesRedirects(t *testing.T) {
+	followed := false
+	final := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		followed = true
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer final.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, final.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	store := openTestStore(t)
+	host, err := NewIngestHost(IngestHostConfig{
+		Port: 8791, Store: store, Target: ingestTestTarget, Now: func() int64 { return ingestTestNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector, err := host.Add(IngestSource{Source: "runs", Secret: ingestTestSecret, ReplyURL: redirector.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = connector.PostReply(context.Background(), DeliveryContext{
+		Delivery: Delivery{ID: "delivery-1", Target: ingestTestTarget}, Event: Event{EventKey: "event-1"},
+	}, "answer")
+	if err == nil || !strings.Contains(err.Error(), "redirect") || followed {
+		t.Fatalf("PostReply error = %v, followed = %v", err, followed)
+	}
+}
+
+func TestParseIngestSourcesValidatesReplyPrefixes(t *testing.T) {
+	valid := `[{"source":"runs","secret":"` + ingestTestSecret + `","reply_url_prefixes":[" https://ci.test/courier/ "]}]`
+	sources, err := ParseIngestSources(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sources[0].ReplyURLPrefixes, []string{"https://ci.test/courier/"}) {
+		t.Fatalf("prefixes = %#v", sources[0].ReplyURLPrefixes)
+	}
+	rejects := map[string]string{
+		"no trailing slash": `[{"source":"runs","secret":"` + ingestTestSecret + `","reply_url_prefixes":["https://ci.test/courier"]}]`,
+		"wrong scheme":      `[{"source":"runs","secret":"` + ingestTestSecret + `","reply_url_prefixes":["ftp://ci.test/courier/"]}]`,
+		"no host":           `[{"source":"runs","secret":"` + ingestTestSecret + `","reply_url_prefixes":["https:///courier/"]}]`,
+		"carries a query":   `[{"source":"runs","secret":"` + ingestTestSecret + `","reply_url_prefixes":["https://ci.test/courier/?token=x"]}]`,
+		"carries userinfo":  `[{"source":"runs","secret":"` + ingestTestSecret + `","reply_url_prefixes":["https://user:pass@ci.test/courier/"]}]`,
+		"empty entry":       `[{"source":"runs","secret":"` + ingestTestSecret + `","reply_url_prefixes":[""]}]`,
+	}
+	for name, declaration := range rejects {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseIngestSources(declaration); err == nil {
+				t.Fatal("declaration accepted")
+			}
+		})
+	}
+}
+
+func TestIngestInstructionsDescribeReplyReach(t *testing.T) {
+	_, _, connectors := newIngestTestHost(t,
+		ingestTestSource("oneway"),
+		ingestPrefixSource("perevent", "https://ci.test/courier/"),
+		IngestSource{Source: "twoway", Secret: ingestTestSecret, ReplyURL: "https://receiver.test/reply"},
+	)
+	wants := []string{"one-way", "Only some perevent events can be answered", "chat_reply sends your answer back to twoway"}
+	for index, want := range wants {
+		if instructions := connectors[index].Instructions(); !strings.Contains(instructions, want) {
+			t.Fatalf("instructions %d omit %q: %q", index, want, instructions)
+		}
+	}
+}
+
+func TestParsePushArgsReplyURL(t *testing.T) {
+	parsed, err := parsePushArgs([]string{"--source", "runs", "--reply-url", "https://ci.test/courier/run/1"})
+	if err != nil || parsed.replyURL != "https://ci.test/courier/run/1" {
+		t.Fatalf("parsed = %#v, %v", parsed, err)
+	}
+}

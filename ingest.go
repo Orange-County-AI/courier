@@ -38,6 +38,7 @@ const (
 	ingestMaxContentBytes   = 64 << 10
 	ingestMaxIDChars        = 200
 	ingestMaxUserChars      = 200
+	ingestMaxURLChars       = 2048
 	ingestMaxMetaEntries    = 32
 	ingestMaxMetaKeyChars   = 64
 	ingestMaxMetaValueChars = 1024
@@ -60,11 +61,17 @@ var (
 )
 
 // IngestSource is one declared integration: the operator's half of the spec.
+// ReplyURLPrefixes is the only way a sender-supplied reply endpoint is ever
+// honoured, and it is operator config for a reason: courier POSTing to a URL
+// chosen by whoever holds a source secret is a confused deputy — courier's own
+// unauthenticated loopback IPC and a cloud metadata service are both reachable
+// from where courier runs and neither is reachable from the sender.
 type IngestSource struct {
-	Source       string `json:"source"`
-	Secret       string `json:"secret"`
-	ReplyURL     string `json:"reply_url,omitempty"`
-	Instructions string `json:"instructions,omitempty"`
+	Source           string   `json:"source"`
+	Secret           string   `json:"secret"`
+	ReplyURL         string   `json:"reply_url,omitempty"`
+	ReplyURLPrefixes []string `json:"reply_url_prefixes,omitempty"`
+	Instructions     string   `json:"instructions,omitempty"`
 }
 
 // IngestEvent is the request body. Unknown fields are ignored on purpose: the
@@ -77,6 +84,7 @@ type IngestEvent struct {
 	User           string            `json:"user,omitempty"`
 	Trigger        string            `json:"trigger,omitempty"`
 	Content        string            `json:"content"`
+	ReplyURL       string            `json:"reply_url,omitempty"`
 	Meta           map[string]string `json:"meta,omitempty"`
 }
 
@@ -139,16 +147,20 @@ func ParseIngestSources(raw string) ([]IngestSource, error) {
 		}
 		replyURL := strings.TrimSpace(source.ReplyURL)
 		if replyURL != "" {
-			parsedURL, err := url.Parse(replyURL)
-			if err != nil {
-				return nil, fmt.Errorf("ingest source %q has an unparseable reply_url: %w", name, err)
+			if err := validateIngestReplyURL(replyURL); err != nil {
+				return nil, fmt.Errorf("ingest source %q has an invalid reply_url: %w", name, err)
 			}
-			if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-				return nil, fmt.Errorf("ingest source %q has reply_url scheme %q; use http or https", name, parsedURL.Scheme)
+		}
+		prefixes := make([]string, 0, len(source.ReplyURLPrefixes))
+		for _, prefix := range source.ReplyURLPrefixes {
+			prefix = strings.TrimSpace(prefix)
+			if err := validateIngestReplyPrefix(prefix); err != nil {
+				return nil, fmt.Errorf("ingest source %q has an invalid reply_url_prefixes entry %q: %w", name, prefix, err)
 			}
-			if parsedURL.Host == "" {
-				return nil, fmt.Errorf("ingest source %q has a reply_url with no host", name)
-			}
+			prefixes = append(prefixes, prefix)
+		}
+		if len(prefixes) == 0 {
+			prefixes = nil
 		}
 		instructions := strings.TrimSpace(source.Instructions)
 		if len(instructions) > ingestMaxInstructions {
@@ -158,10 +170,49 @@ func ParseIngestSources(raw string) ([]IngestSource, error) {
 			)
 		}
 		parsed = append(parsed, IngestSource{
-			Source: name, Secret: secret, ReplyURL: replyURL, Instructions: instructions,
+			Source: name, Secret: secret, ReplyURL: replyURL,
+			ReplyURLPrefixes: prefixes, Instructions: instructions,
 		})
 	}
 	return parsed, nil
+}
+
+// validateIngestReplyURL is the shape every reply destination must have, whether
+// it came from operator config or from a sender inside an allowed prefix.
+func validateIngestReplyURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("unparseable: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("scheme %q; use http or https", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("no host")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("carries userinfo; put credentials in the receiver's own check, not the URL")
+	}
+	return nil
+}
+
+// validateIngestReplyPrefix requires a trailing slash so matching is a path
+// boundary rather than a string boundary: without it a prefix ending in
+// "/courier" would also authorize "/courier-evil" on the same host.
+func validateIngestReplyPrefix(prefix string) error {
+	if prefix == "" {
+		return fmt.Errorf("is empty")
+	}
+	if err := validateIngestReplyURL(prefix); err != nil {
+		return err
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		return fmt.Errorf("must end with / so it matches a path boundary")
+	}
+	if strings.ContainsAny(prefix, "?#") {
+		return fmt.Errorf("must be a scheme, host and path prefix, with no query or fragment")
+	}
+	return nil
 }
 
 // LoadIngestSources mirrors the Gmail accounts loader: the inline value wins,
@@ -232,7 +283,15 @@ func NewIngestHost(config IngestHostConfig) (*IngestHost, error) {
 	}
 	client := config.Client
 	if client == nil {
-		client = http.DefaultClient
+		// Redirects are refused rather than followed: a 302 would move the POST off
+		// the declared destination, which is exactly the hop an allowlist exists to
+		// prevent. The receiver's own URL is the contract.
+		client = &http.Client{
+			Timeout: ingestReplyTimeout,
+			CheckRedirect: func(request *http.Request, _ []*http.Request) error {
+				return fmt.Errorf("reply endpoint redirected to %s; courier posts only to the declared URL", request.URL.Redacted())
+			},
+		}
 	}
 	now := config.Now
 	if now == nil {
@@ -395,10 +454,14 @@ func (c *IngestConnector) Instructions() string {
 	builder.WriteString(" integration arrive with connector=\"")
 	builder.WriteString(name)
 	builder.WriteString("\"; its conversation_id is opaque and is passed back unchanged.")
-	if c.source.ReplyURL == "" {
+	switch {
+	case c.source.ReplyURL == "" && len(c.source.ReplyURLPrefixes) == 0:
 		builder.WriteString(" This source is one-way: it accepts no replies, chat_reply is refused for it, " +
 			"and its messages are settled with mark_handled once you have acted on them.")
-	} else {
+	case c.source.ReplyURL == "":
+		builder.WriteString(" Only some " + name + " events can be answered: chat_reply works when the event " +
+			"carried its own reply endpoint and is refused otherwise, which you settle with mark_handled.")
+	default:
 		builder.WriteString(" chat_reply sends your answer back to " + name + " over its integration endpoint.")
 	}
 	if c.source.Instructions != "" {
@@ -416,22 +479,78 @@ func (c *IngestConnector) Start(ctx context.Context) error { return c.host.start
 
 func (c *IngestConnector) Stop(ctx context.Context) error { return c.host.stop(ctx) }
 
-// RefuseReply keeps a one-way source out of the retry loop. Refusing at the tool
-// boundary leaves no recorded reply, so nothing is retried forever and the agent
-// is told the one thing it can still do.
-func (c *IngestConnector) RefuseReply(DeliveryContext) string {
-	if c.source.ReplyURL != "" {
-		return ""
+// replyDestination resolves where this delivery's answer goes, and is the single
+// authority both RefuseReply and PostReply ask. A sender-supplied reply_url is
+// re-checked here rather than trusted from ingest time: the operator's allowlist
+// at the moment of posting is what decides, not the one that was live when the
+// event arrived.
+func (c *IngestConnector) replyDestination(event Event) (string, error) {
+	var carried struct {
+		ReplyURL string `json:"reply_url"`
 	}
-	return "source " + c.source.Source + " accepts no replies — it declares no reply endpoint, so nothing you " +
-		"pass to chat_reply could reach anyone. Settle this message with mark_handled instead."
+	if event.RawJSON != "" {
+		// A ledger row courier itself wrote; an unparseable body means only that
+		// this event carried no per-event routing.
+		_ = json.Unmarshal([]byte(event.RawJSON), &carried)
+	}
+	requested := strings.TrimSpace(carried.ReplyURL)
+	if requested == "" {
+		return c.source.ReplyURL, nil
+	}
+	if err := c.allowReplyURL(requested); err != nil {
+		return "", err
+	}
+	return requested, nil
+}
+
+// allowReplyURL is the whole capability boundary for sender-chosen destinations:
+// a literal prefix the operator declared, no redirects afterwards, nothing else.
+func (c *IngestConnector) allowReplyURL(requested string) error {
+	if err := validateIngestReplyURL(requested); err != nil {
+		return fmt.Errorf("reply_url is invalid: %w", err)
+	}
+	if len(c.source.ReplyURLPrefixes) == 0 {
+		return fmt.Errorf(
+			"source %s does not accept a per-event reply_url; the operator declares no reply_url_prefixes for it",
+			c.source.Source,
+		)
+	}
+	for _, prefix := range c.source.ReplyURLPrefixes {
+		if strings.HasPrefix(requested, prefix) {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"reply_url %s is outside the reply_url_prefixes declared for source %s",
+		requested, c.source.Source,
+	)
+}
+
+// RefuseReply keeps a delivery with no reachable destination out of the retry
+// loop. Refusing at the tool boundary leaves no recorded reply, so nothing is
+// retried forever and the agent is told the one thing it can still do.
+func (c *IngestConnector) RefuseReply(dc DeliveryContext) string {
+	destination, err := c.replyDestination(dc.Event)
+	if err != nil {
+		return "source " + c.source.Source + " cannot be answered for this message: " + err.Error() +
+			". Nothing you pass to chat_reply could reach anyone; settle it with mark_handled."
+	}
+	if destination == "" {
+		return "source " + c.source.Source + " accepts no replies — it declares no reply endpoint, so nothing you " +
+			"pass to chat_reply could reach anyone. Settle this message with mark_handled instead."
+	}
+	return ""
 }
 
 // PostReply returns nil only for a 2xx from the source's reply endpoint. That
 // 2xx is what settles the delivery, so anything else — including a timeout — has
 // to stay an error for RetryPosts to own.
 func (c *IngestConnector) PostReply(ctx context.Context, dc DeliveryContext, message string) error {
-	if c.source.ReplyURL == "" {
+	destination, err := c.replyDestination(dc.Event)
+	if err != nil {
+		return err
+	}
+	if destination == "" {
 		return fmt.Errorf("source %s declares no reply_url", c.source.Source)
 	}
 	if err := c.host.shadow.Refuse("posting a reply to " + c.source.Source); err != nil {
@@ -461,7 +580,7 @@ func (c *IngestConnector) PostReply(ctx context.Context, dc DeliveryContext, mes
 	}
 	postCtx, cancel := context.WithTimeout(ctx, ingestReplyTimeout)
 	defer cancel()
-	request, err := http.NewRequestWithContext(postCtx, http.MethodPost, c.source.ReplyURL, strings.NewReader(string(payload)))
+	request, err := http.NewRequestWithContext(postCtx, http.MethodPost, destination, strings.NewReader(string(payload)))
 	if err != nil {
 		return err
 	}
@@ -524,6 +643,15 @@ func (c *IngestConnector) serveIngest(w http.ResponseWriter, request *http.Reque
 	if err := event.validate(); err != nil {
 		writeIngestReject(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// Checked at ingest so the sender learns immediately, and checked again at post
+	// time because config, not arrival, is the authority on where a reply may go.
+	if requested := strings.TrimSpace(event.ReplyURL); requested != "" {
+		if err := c.allowReplyURL(requested); err != nil {
+			c.host.log("ingest drop: %v", err)
+			writeIngestReject(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	stored, delivery, err := c.ingest(event, raw)
@@ -610,6 +738,9 @@ func (e IngestEvent) validate() error {
 	}
 	if utf8.RuneCountInString(e.User) > ingestMaxUserChars {
 		return fmt.Errorf("user exceeds %d characters", ingestMaxUserChars)
+	}
+	if utf8.RuneCountInString(e.ReplyURL) > ingestMaxURLChars {
+		return fmt.Errorf("reply_url exceeds %d characters", ingestMaxURLChars)
 	}
 	if utf8.RuneCountInString(e.Trigger) > MaxTriggerChars {
 		return fmt.Errorf("trigger exceeds %d characters", MaxTriggerChars)
