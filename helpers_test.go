@@ -44,6 +44,11 @@ type DispatchFakeRename struct {
 	Name   string
 }
 
+type DispatchFakeNotice struct {
+	Title string
+	Body  string
+}
+
 // FakeDriver keeps one ordered log across all methods. Tests should mutate its
 // controls before starting goroutines and use the snapshot methods for reads.
 type FakeDriver struct {
@@ -52,6 +57,7 @@ type FakeDriver struct {
 	Calls   []string
 	Prompts []DispatchFakePrompt
 	Starts  []DispatchFakeStart
+	Notices []DispatchFakeNotice
 	Renames []DispatchFakeRename
 
 	PromptResults []PromptResult
@@ -71,6 +77,7 @@ type FakeDriver struct {
 	// configured" error so tests that predate the draft guard still dispatch.
 	PaneScreens   map[string]string
 	PaneScreenErr error
+	NotifyErr     error
 
 	currentPrompts       int
 	MaxConcurrentPrompts int
@@ -223,6 +230,20 @@ func (d *FakeDriver) PaneScreen(_ context.Context, paneID string) (string, error
 		return "", errors.New("fake pane screen not configured")
 	}
 	return screen, nil
+}
+
+func (d *FakeDriver) Notify(_ context.Context, title, body string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.Calls = append(d.Calls, "notify:"+title)
+	d.Notices = append(d.Notices, DispatchFakeNotice{Title: title, Body: body})
+	return d.NotifyErr
+}
+
+func (d *FakeDriver) NoticeLog() []DispatchFakeNotice {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]DispatchFakeNotice(nil), d.Notices...)
 }
 
 func (d *FakeDriver) CallLog() []string {

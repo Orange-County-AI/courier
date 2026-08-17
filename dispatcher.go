@@ -18,6 +18,7 @@ type DispatcherOptions struct {
 	Now             func() int64
 	EnvelopePreview *bool
 	DraftGuard      *bool
+	NotifyHolds     *bool
 	Shadow          ShadowMode
 	Connectors      *Registry
 }
@@ -59,6 +60,7 @@ type Dispatcher struct {
 	now           func() int64
 	previewOn     bool
 	draftGuard    bool
+	notifyHolds   bool
 	shadow        ShadowMode
 	connectors    *Registry
 
@@ -67,6 +69,7 @@ type Dispatcher struct {
 	last    *ReconcileResult
 	status  *TargetStatus
 	hold    *DraftHold
+	paused  bool
 }
 
 func NewDispatcher(opts DispatcherOptions) (*Dispatcher, error) {
@@ -103,6 +106,10 @@ func NewDispatcher(opts DispatcherOptions) (*Dispatcher, error) {
 	if opts.DraftGuard != nil {
 		draftGuard = *opts.DraftGuard
 	}
+	notifyHolds := true
+	if opts.NotifyHolds != nil {
+		notifyHolds = *opts.NotifyHolds
+	}
 	return &Dispatcher{
 		store:         opts.Store,
 		driver:        opts.Driver,
@@ -114,6 +121,7 @@ func NewDispatcher(opts DispatcherOptions) (*Dispatcher, error) {
 		now:           now,
 		previewOn:     previewOn,
 		draftGuard:    draftGuard,
+		notifyHolds:   notifyHolds,
 		shadow:        opts.Shadow,
 		connectors:    opts.Connectors,
 	}, nil
@@ -224,6 +232,21 @@ func (d *Dispatcher) DraftHold() *DraftHold {
 	return &hold
 }
 
+// SetPaused stops or resumes claiming. Pause is process-lifetime state and
+// deliberately not persisted: a courier restart resumes delivery, so a paused
+// gateway can never become a silently permanent one.
+func (d *Dispatcher) SetPaused(paused bool) {
+	d.stateMu.Lock()
+	d.paused = paused
+	d.stateMu.Unlock()
+}
+
+func (d *Dispatcher) Paused() bool {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	return d.paused
+}
+
 // Sweep returns unconfirmed deliveries to the queue after their read-sensitive
 // backoff. It never settles or abandons a delivery.
 func (d *Dispatcher) Sweep(now ...int64) ([]string, error) {
@@ -247,6 +270,11 @@ func (d *Dispatcher) Drain(ctx context.Context) ([]DispatchOutcome, error) {
 	// This is before TryLock so shadow cannot claim a row or burn an attempt even
 	// if another caller is currently draining.
 	if d.shadow.Suppressed() {
+		return nil, nil
+	}
+	// Same reasoning as the shadow check: a paused dispatcher must claim nothing
+	// and burn no attempt, whoever else is draining.
+	if d.Paused() {
 		return nil, nil
 	}
 	if !d.drainMu.TryLock() {
@@ -278,7 +306,7 @@ func (d *Dispatcher) Drain(ctx context.Context) ([]DispatchOutcome, error) {
 				return outcomes, nil
 			}
 			if hold := d.composerHold(ctx); hold != nil {
-				d.applyDraftHold(*hold)
+				d.applyDraftHold(ctx, *hold)
 				return outcomes, nil
 			}
 			d.releaseDraftHold()
@@ -379,14 +407,39 @@ func (d *Dispatcher) composerHold(ctx context.Context) *DraftHold {
 	return &DraftHold{PaneID: agent.PaneID, Agent: agent.Agent, At: d.now()}
 }
 
-func (d *Dispatcher) applyDraftHold(hold DraftHold) {
+func (d *Dispatcher) applyDraftHold(ctx context.Context, hold DraftHold) {
 	d.stateMu.Lock()
 	first := d.hold == nil || d.hold.PaneID != hold.PaneID
 	d.hold = &hold
 	d.stateMu.Unlock()
-	if first {
-		d.log(fmt.Sprintf("dispatch held — %s has unsent input in pane %s; retrying until the composer is clear", hold.Agent, hold.PaneID))
+	if !first {
+		return
 	}
+	d.log(fmt.Sprintf("dispatch held — %s has unsent input in pane %s; retrying until the composer is clear", hold.Agent, hold.PaneID))
+	if !d.notifyHolds {
+		return
+	}
+	// One toast on the same edge the log line is written. A held message is
+	// otherwise invisible, and re-notifying every tick would train the human to
+	// ignore it. A notification is an extra: its failure never fails the drain.
+	if err := d.driver.Notify(ctx, "courier: message waiting", d.holdNotice()); err != nil {
+		d.log(fmt.Sprintf("notify failed — %v", err))
+	}
+}
+
+// holdNotice names who is waiting and how many, so the toast is actionable
+// without opening the inbox. A listing failure degrades to the bare reason
+// rather than suppressing the notification.
+func (d *Dispatcher) holdNotice() string {
+	open, err := d.store.OpenDeliveries(d.target)
+	if err != nil || len(open) == 0 {
+		return "delivery held until your composer is clear"
+	}
+	who := open[0].Event.Connector
+	if user := open[0].Event.User; user != nil && *user != "" {
+		who = *user + " on " + who
+	}
+	return fmt.Sprintf("%s — %d waiting until your composer is clear", who, len(open))
 }
 
 func (d *Dispatcher) releaseDraftHold() {

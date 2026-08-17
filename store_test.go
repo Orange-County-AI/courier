@@ -425,3 +425,55 @@ func TestReconcilerStatePreservesAndBumpsGeneration(t *testing.T) {
 		t.Fatalf("generation reset on upsert: %#v, %v", state, err)
 	}
 }
+
+func TestOpenDeliveriesListsOnlyTheActionableQueue(t *testing.T) {
+	store := openTestStore(t)
+	user := "Dana"
+	waiting, err := store.InsertEvent(EventInsert{
+		Connector: "mattermost", EventKey: "waiting", ConversationID: "channel-7:thread-9",
+		User: &user, Content: "Can you check whether the Friday batch went out", MetaJSON: "{}", RawJSON: "{}",
+	}, 100)
+	if err != nil || waiting == nil {
+		t.Fatalf("InsertEvent: %#v, %v", waiting, err)
+	}
+	waitingDelivery := insertTestDelivery(t, store, waiting.ID, "agent", 100)
+	anonymous := insertTestEvent(t, store, "anonymous", "conv", 110)
+	anonymousDelivery := insertTestDelivery(t, store, anonymous.ID, "agent", 110)
+	if _, err := store.MarkRead(anonymousDelivery.ID, 120); err != nil {
+		t.Fatal(err)
+	}
+	handled := insertTestEvent(t, store, "handled", "conv", 130)
+	handledDelivery := insertTestDelivery(t, store, handled.ID, "agent", 130)
+	if !store.MarkHandled(MarkHandledArgs{DeliveryID: handledDelivery.ID}, 140) {
+		t.Fatal("MarkHandled did not settle the row")
+	}
+	failed := insertTestEvent(t, store, "failed", "conv", 150)
+	failedDelivery := insertTestDelivery(t, store, failed.ID, "agent", 150)
+	if err := store.FailDelivery(failedDelivery.ID, "gave up"); err != nil {
+		t.Fatal(err)
+	}
+	other := insertTestEvent(t, store, "other-target", "conv", 160)
+	insertTestDelivery(t, store, other.ID, "someone-else", 160)
+
+	open, err := store.OpenDeliveries("agent")
+	if err != nil {
+		t.Fatalf("OpenDeliveries: %v", err)
+	}
+	if len(open) != 2 {
+		t.Fatalf("open rows = %d, want the two unhandled rows for this target: %#v", len(open), open)
+	}
+	first, second := open[0], open[1]
+	if first.Delivery.ID != waitingDelivery.ID || second.Delivery.ID != anonymousDelivery.ID {
+		t.Fatalf("order = %s then %s, want oldest event first", first.Delivery.ID, second.Delivery.ID)
+	}
+	if first.Event.Connector != "mattermost" || first.Event.User == nil || *first.Event.User != "Dana" ||
+		first.Event.Content != "Can you check whether the Friday batch went out" {
+		t.Fatalf("joined event = %#v", first.Event)
+	}
+	if first.Delivery.Status != DeliveryPending || first.Delivery.ReadAt != nil {
+		t.Fatalf("unread row = %#v", first.Delivery)
+	}
+	if second.Event.User != nil || second.Delivery.ReadAt == nil {
+		t.Fatalf("read anonymous row = %#v %#v", second.Event, second.Delivery)
+	}
+}

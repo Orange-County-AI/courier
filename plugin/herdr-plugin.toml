@@ -1,0 +1,45 @@
+id = "courier.inbox"
+name = "Courier Inbox"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Held-message inbox and delivery control for the courier gateway"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["courier", "plugin-probe"]
+
+[[panes]]
+id = "inbox"
+title = "Courier inbox"
+placement = "popup"
+width = "80%"
+height = 20
+command = ["courier", "inbox"]
+
+# herdr keybindings bind plugin actions, not panes, so opening the pane needs an
+# action. Manifest argv is not run through a shell: anything that needs env
+# expansion names `sh -c` explicitly.
+[[actions]]
+id = "open-inbox"
+title = "Courier inbox"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin courier.inbox --entrypoint inbox --placement popup"]
+
+[[actions]]
+id = "deliver-now"
+title = "Courier: deliver now"
+contexts = ["workspace"]
+command = ["courier", "kick"]
+
+[[actions]]
+id = "toggle-pause"
+title = "Courier: pause/resume delivery"
+contexts = ["workspace"]
+command = ["courier", "pause", "--toggle"]
+
+# A held message otherwise waits up to COURIER_TICK_MS (default 15s) after the
+# human submits their own prompt. The hook kicks the daemon on the status change
+# that submission causes, and only when the hold names that exact pane.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["courier", "kick", "--if-pane-matches"]

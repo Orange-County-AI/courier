@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -443,6 +444,48 @@ func nullableString(value sql.NullString) *string {
 	return &v
 }
 
+// eventColumns spells out the order scanEvent expects. Queries that read events
+// alone can rely on `SELECT *`; a join cannot, because it has to interleave two
+// tables' columns.
+const eventColumns = "id, connector, event_key, conversation_id, user, content, meta_json, raw_json, received_at, handled_at"
+
+func prefixColumns(alias, columns string) string {
+	parts := strings.Split(columns, ", ")
+	for i, part := range parts {
+		parts[i] = alias + "." + part
+	}
+	return strings.Join(parts, ", ")
+}
+
+func deliveryColumnsPrefixed(alias string) string { return prefixColumns(alias, deliveryColumns) }
+
+func eventColumnsPrefixed(alias string) string { return prefixColumns(alias, eventColumns) }
+
+// scanDeliverableRow reads deliveryColumns followed by eventColumns from one
+// joined row. The two field lists are spelled out once each here because a
+// single Scan cannot be composed from scanDelivery and scanEvent.
+func scanDeliverableRow(row rowScanner, delivery *Delivery, event *Event) error {
+	var status string
+	var lastDispatchedAt, sessionGeneration, readAt, handledAt sql.NullInt64
+	var lastError, user sql.NullString
+	if err := row.Scan(
+		&delivery.ID, &delivery.EventID, &delivery.Target, &status, &delivery.AttemptCount,
+		&lastDispatchedAt, &lastError, &sessionGeneration, &readAt, &delivery.CreatedAt,
+		&event.ID, &event.Connector, &event.EventKey, &event.ConversationID, &user,
+		&event.Content, &event.MetaJSON, &event.RawJSON, &event.ReceivedAt, &handledAt,
+	); err != nil {
+		return err
+	}
+	delivery.Status = DeliveryStatus(status)
+	delivery.LastDispatchedAt = nullableInt(lastDispatchedAt)
+	delivery.LastError = nullableString(lastError)
+	delivery.SessionGeneration = nullableInt(sessionGeneration)
+	delivery.ReadAt = nullableInt(readAt)
+	event.User = nullableString(user)
+	event.HandledAt = nullableInt(handledAt)
+	return nil
+}
+
 func scanEvent(row rowScanner) (*Event, error) {
 	var event Event
 	var user sql.NullString
@@ -620,6 +663,33 @@ func (s *Store) DeliveriesForTarget(target string) ([]Delivery, error) {
 		deliveries = append(deliveries, *delivery)
 	}
 	return deliveries, rows.Err()
+}
+
+// OpenDeliveries is the queue a human can still act on: pending and dispatched
+// rows for one target whose event is unhandled, oldest first by event id — the
+// same ordering ClaimNext dispatches in, so the inbox lists what is next. The
+// join keeps it one query; handled, failed and other targets' rows are absent.
+func (s *Store) OpenDeliveries(target string) ([]Deliverable, error) {
+	rows, err := s.db.Query(`
+        SELECT `+deliveryColumnsPrefixed("d")+`, `+eventColumnsPrefixed("e")+`
+        FROM deliveries d
+        JOIN events e ON e.id = d.event_id
+        WHERE d.target = ? AND d.status IN ('pending','dispatched') AND e.handled_at IS NULL
+        ORDER BY e.id ASC`, target)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	open := make([]Deliverable, 0)
+	for rows.Next() {
+		var delivery Delivery
+		var event Event
+		if err := scanDeliverableRow(rows, &delivery, &event); err != nil {
+			return nil, err
+		}
+		open = append(open, Deliverable{Delivery: delivery, Event: event})
+	}
+	return open, rows.Err()
 }
 
 // HasClaimable answers the exact selection ClaimNext would make, without

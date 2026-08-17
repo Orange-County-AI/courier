@@ -82,6 +82,8 @@ type serveTestDispatcher struct {
 	tick   func(context.Context) ([]DispatchOutcome, error)
 	status *TargetStatus
 	hold   *DraftHold
+	mu     sync.Mutex
+	paused bool
 }
 
 func (d *serveTestDispatcher) Start(ctx context.Context) (ReconcileResult, error) {
@@ -99,6 +101,18 @@ func (d *serveTestDispatcher) Tick(ctx context.Context) ([]DispatchOutcome, erro
 func (d *serveTestDispatcher) TargetStatus() *TargetStatus { return d.status }
 
 func (d *serveTestDispatcher) DraftHold() *DraftHold { return d.hold }
+
+func (d *serveTestDispatcher) Paused() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.paused
+}
+
+func (d *serveTestDispatcher) SetPaused(paused bool) {
+	d.mu.Lock()
+	d.paused = paused
+	d.mu.Unlock()
+}
 
 type serveTestConnector struct {
 	name  string

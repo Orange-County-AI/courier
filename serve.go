@@ -29,6 +29,8 @@ type serveDispatcher interface {
 	Tick(context.Context) ([]DispatchOutcome, error)
 	TargetStatus() *TargetStatus
 	DraftHold() *DraftHold
+	Paused() bool
+	SetPaused(bool)
 }
 
 type serveHTTPServer interface {
@@ -96,6 +98,7 @@ func serveDefaultDependencies() serveDependencies {
 		newDispatcher: func(store *Store, driver serveManagedDriver, connectors *Registry, opts ServeOptions, logf serveLogFunc) (serveDispatcher, error) {
 			preview := opts.EnvelopePreview
 			draftGuard := opts.DraftGuard
+			notifyHolds := opts.DraftNotify
 			return NewDispatcher(DispatcherOptions{
 				Store:           store,
 				Driver:          driver,
@@ -104,6 +107,7 @@ func serveDefaultDependencies() serveDependencies {
 				PromptTimeout:   opts.PromptTimeout,
 				EnvelopePreview: &preview,
 				DraftGuard:      &draftGuard,
+				NotifyHolds:     &notifyHolds,
 				Shadow:          opts.Shadow,
 				Connectors:      connectors,
 				Log:             func(message string) { logf("%s", message) },
@@ -235,6 +239,7 @@ func serveHealthState(opts ServeOptions, connectors []Connector, dispatcher serv
 		Org:        opts.Org,
 		Target:     opts.Target,
 		Shadow:     opts.Shadow.Enabled,
+		Paused:     dispatcher.Paused(),
 		Connectors: names,
 		HostTools:  append([]string(nil), HostToolNames...),
 	}
@@ -253,6 +258,42 @@ func serveHealthState(opts ServeOptions, connectors []Connector, dispatcher serv
 		state.DraftHoldAt = &at
 	}
 	return state
+}
+
+// serveInboxState renders the open queue for the plugin pane, including the
+// reason delivery is held. The preview is the same 100-char pointer the envelope
+// carries, so the pane and the agent describe a message identically.
+func serveInboxState(store *Store, opts ServeOptions, dispatcher serveDispatcher) (InboxState, error) {
+	open, err := store.OpenDeliveries(opts.Target)
+	if err != nil {
+		return InboxState{}, fmt.Errorf("list open deliveries: %w", err)
+	}
+	rows := make([]InboxRow, 0, len(open))
+	for _, item := range open {
+		user := ""
+		if item.Event.User != nil {
+			user = *item.Event.User
+		}
+		rows = append(rows, InboxRow{
+			DeliveryID:     item.Delivery.ID,
+			EventID:        item.Event.ID,
+			Status:         string(item.Delivery.Status),
+			Connector:      item.Event.Connector,
+			ConversationID: item.Event.ConversationID,
+			User:           user,
+			AttemptCount:   int(item.Delivery.AttemptCount),
+			Read:           item.Delivery.ReadAt != nil,
+			CreatedAt:      item.Delivery.CreatedAt,
+			LastError:      item.Delivery.LastError,
+			Preview:        preview(item.Event.Content),
+		})
+	}
+	return InboxState{
+		Target:    opts.Target,
+		Paused:    dispatcher.Paused(),
+		DraftHold: dispatcher.DraftHold(),
+		Rows:      rows,
+	}, nil
 }
 
 func serveAssemble(ctx context.Context, opts ServeOptions, deps serveDependencies, logf serveLogFunc) (*serveRuntime, error) {
@@ -313,6 +354,28 @@ func serveAssemble(ctx context.Context, opts ServeOptions, deps serveDependencie
 		},
 		Health: func() HealthState {
 			return serveHealthState(opts, connectors, dispatcher)
+		},
+		Inbox: func(context.Context) (InboxState, error) {
+			return serveInboxState(store, opts, dispatcher)
+		},
+		// A kick goes through runTick, not Drain: Drain alone skips reply retry
+		// and reconcile, and would run beside the periodic tick instead of
+		// serialized with it.
+		Kick: func(kickCtx context.Context) (KickResult, error) {
+			outcomes, busy := runtime.runTick(kickCtx)
+			return KickResult{Busy: busy, Outcomes: outcomes}, nil
+		},
+		Pause: func(pauseCtx context.Context, paused bool) (bool, error) {
+			dispatcher.SetPaused(paused)
+			if paused {
+				logf("delivery paused by request — nothing will be claimed until resumed")
+				return dispatcher.Paused(), nil
+			}
+			// Resume delivers now rather than at the next tick: a human who just
+			// pressed resume is watching the pane.
+			logf("delivery resumed by request")
+			runtime.runTick(pauseCtx)
+			return dispatcher.Paused(), nil
 		},
 		Log: func(values ...any) { logf("%s", fmt.Sprint(values...)) },
 	})
@@ -397,17 +460,22 @@ func (r *serveRuntime) startLoops(ctx context.Context) {
 	}()
 }
 
-func (r *serveRuntime) runTick(ctx context.Context) {
+// runTick reports how many deliveries it dispatched and whether another tick
+// already held the lock. The periodic loop ignores both; an on-demand kick needs
+// them to tell a human "delivered 2" from "busy".
+func (r *serveRuntime) runTick(ctx context.Context) (int, bool) {
 	if !r.tickMu.TryLock() {
-		return
+		return 0, true
 	}
 	defer r.tickMu.Unlock()
 	if _, err := r.hostTools.RetryPosts(ctx); err != nil {
 		r.log("post retry sweep failed: %v", err)
 	}
-	if _, err := r.dispatcher.Tick(ctx); err != nil {
+	outcomes, err := r.dispatcher.Tick(ctx)
+	if err != nil {
 		r.log("dispatcher tick failed: %v", err)
 	}
+	return len(outcomes), false
 }
 
 func (r *serveRuntime) logShadowHeartbeat() {

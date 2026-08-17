@@ -120,6 +120,7 @@ func TestServeOptionsFullSurface(t *testing.T) {
 		"COURIER_SHADOW":                   "yes",
 		"COURIER_SHADOW_HEARTBEAT_MS":      "6000",
 		"COURIER_ENVELOPE_PREVIEW":         "false",
+		"COURIER_DRAFT_NOTIFY":             "0",
 		"HERDR_SOCKET_PATH":                "/tmp/herdr.sock",
 		"HERDR_SESSION":                    "session",
 		"HERDR_BIN":                        "/bin/herdr",
@@ -149,6 +150,10 @@ func TestServeOptionsFullSurface(t *testing.T) {
 	}
 	if !reflect.DeepEqual(opts.Connectors, []string{"mattermost", "gmail", "kaneo"}) || !opts.Shadow.Enabled || opts.EnvelopePreview {
 		t.Fatalf("serve mode options = %#v", opts)
+	}
+	// Both draft knobs default on and only an explicit 0/false turns them off.
+	if opts.DraftNotify || !opts.DraftGuard {
+		t.Fatalf("draft options = guard %t notify %t", opts.DraftGuard, opts.DraftNotify)
 	}
 	if opts.Herdr.SocketPath != "/tmp/herdr.sock" || opts.Herdr.Session != "session" || opts.Herdr.Bin != "/bin/herdr" {
 		t.Fatalf("herdr options = %#v", opts.Herdr)

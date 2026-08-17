@@ -531,3 +531,102 @@ func TestDraftGuardOffDispatchesIntoADraft(t *testing.T) {
 		t.Fatalf("calls = %v, want the prompt only", calls)
 	}
 }
+
+func TestPausedDrainClaimsNothing(t *testing.T) {
+	h := dispatchNewHarness(t)
+	row := h.Enqueue(t, DispatchEnqueueInput{Key: "e1", Content: "hello?"})
+	h.Dispatcher.SetPaused(true)
+
+	outcomes, err := h.Dispatcher.Drain(context.Background())
+	if err != nil || len(outcomes) != 0 {
+		t.Fatalf("paused Drain = %#v, %v", outcomes, err)
+	}
+	if prompts := h.Driver.PromptLog(); len(prompts) != 0 {
+		t.Fatalf("paused dispatcher prompted: %#v", prompts)
+	}
+	// A pause must cost the delivery nothing: same status, no burnt attempt.
+	delivery := getTestDelivery(t, h.Store, row.DeliveryID)
+	if delivery.Status != DeliveryPending || delivery.AttemptCount != 0 || delivery.LastError != nil {
+		t.Fatalf("paused delivery = %#v", delivery)
+	}
+	if !h.Dispatcher.Paused() {
+		t.Fatal("Paused() = false after SetPaused(true)")
+	}
+
+	h.Dispatcher.SetPaused(false)
+	outcomes, err = h.Dispatcher.Drain(context.Background())
+	if err != nil || len(outcomes) != 1 || !outcomes[0].OK {
+		t.Fatalf("resumed Drain = %#v, %v", outcomes, err)
+	}
+}
+
+func TestDraftHoldNotifiesOncePerHold(t *testing.T) {
+	h := dispatchNewHarness(t)
+	h.Enqueue(t, DispatchEnqueueInput{Key: "e1", User: "Dana", Content: "Can you check the batch"})
+	h.Enqueue(t, DispatchEnqueueInput{Key: "e2", User: "Sam", Content: "second"})
+	h.Driver.PaneScreens = map[string]string{"w1:p1": readScreenFixture(t, "claude-draft.txt")}
+
+	if outcomes, err := h.Dispatcher.Drain(context.Background()); err != nil || len(outcomes) != 0 {
+		t.Fatalf("held Drain = %#v, %v", outcomes, err)
+	}
+	notices := h.Driver.NoticeLog()
+	if len(notices) != 1 {
+		t.Fatalf("notices = %#v, want exactly one", notices)
+	}
+	if notices[0].Title != "courier: message waiting" {
+		t.Fatalf("title = %q", notices[0].Title)
+	}
+	if notices[0].Body != "Dana on mattermost — 2 waiting until your composer is clear" {
+		t.Fatalf("body = %q", notices[0].Body)
+	}
+
+	// The hold is observed again on every tick; the human is told once.
+	if outcomes, err := h.Dispatcher.Drain(context.Background()); err != nil || len(outcomes) != 0 {
+		t.Fatalf("second held Drain = %#v, %v", outcomes, err)
+	}
+	if notices := h.Driver.NoticeLog(); len(notices) != 1 {
+		t.Fatalf("notices = %#v, want no second toast for the same pane", notices)
+	}
+}
+
+func TestDraftHoldNotifyFailureDoesNotFailTheDrain(t *testing.T) {
+	h := dispatchNewHarness(t)
+	row := h.Enqueue(t, DispatchEnqueueInput{Key: "e1", Content: "hello?"})
+	h.Driver.PaneScreens = map[string]string{"w1:p1": readScreenFixture(t, "claude-draft.txt")}
+	h.Driver.NotifyErr = errors.New("no foreground client")
+
+	outcomes, err := h.Dispatcher.Drain(context.Background())
+	if err != nil || len(outcomes) != 0 {
+		t.Fatalf("held Drain = %#v, %v", outcomes, err)
+	}
+	if hold := h.Dispatcher.DraftHold(); hold == nil || hold.PaneID != "w1:p1" {
+		t.Fatalf("hold = %#v, want the hold to survive a failed toast", hold)
+	}
+	if delivery := getTestDelivery(t, h.Store, row.DeliveryID); delivery.Status != DeliveryPending || delivery.AttemptCount != 0 {
+		t.Fatalf("delivery = %#v", delivery)
+	}
+}
+
+func TestDraftNotifyOffHoldsSilently(t *testing.T) {
+	h := dispatchNewHarness(t)
+	h.Enqueue(t, DispatchEnqueueInput{Key: "e1", Content: "hello?"})
+	h.Driver.PaneScreens = map[string]string{"w1:p1": readScreenFixture(t, "claude-draft.txt")}
+	notify := false
+	dispatcher, err := NewDispatcher(DispatcherOptions{
+		Store: h.Store, Driver: h.Driver, Target: h.Target, OrgID: h.OrgID,
+		PromptTimeout: 5 * time.Second, Now: h.Clock.Now, NotifyHolds: &notify,
+	})
+	if err != nil {
+		t.Fatalf("NewDispatcher: %v", err)
+	}
+
+	if outcomes, err := dispatcher.Drain(context.Background()); err != nil || len(outcomes) != 0 {
+		t.Fatalf("held Drain = %#v, %v", outcomes, err)
+	}
+	if notices := h.Driver.NoticeLog(); len(notices) != 0 {
+		t.Fatalf("notices = %#v, want none with notification off", notices)
+	}
+	if hold := dispatcher.DraftHold(); hold == nil {
+		t.Fatal("guard stopped holding when notification was disabled")
+	}
+}

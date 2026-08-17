@@ -86,6 +86,7 @@ type ServeOptions struct {
 	ShadowHeartbeat     time.Duration
 	EnvelopePreview     bool
 	DraftGuard          bool
+	DraftNotify         bool
 	Herdr               HerdrOptions
 	Mattermost          MattermostOptions
 	Gmail               GmailOptions
@@ -221,6 +222,10 @@ func serveOptionsFromEnv(lookup envLookup, warn func(string)) (ServeOptions, err
 	if err != nil {
 		return ServeOptions{}, err
 	}
+	draftNotifyRaw, _, err := dual("DRAFT_NOTIFY")
+	if err != nil {
+		return ServeOptions{}, err
+	}
 	if _, set := lookup("CHANNEL_ENVELOPE_TODO"); set && warn != nil {
 		warn("CHANNEL_ENVELOPE_TODO is set but no longer has any effect; courier/1 has no <todo> element")
 	}
@@ -337,6 +342,7 @@ func serveOptionsFromEnv(lookup envLookup, warn func(string)) (ServeOptions, err
 		ShadowHeartbeat:     shadowHeartbeat,
 		EnvelopePreview:     parseDefaultOn(previewRaw),
 		DraftGuard:          parseDefaultOn(draftGuardRaw),
+		DraftNotify:         parseDefaultOn(draftNotifyRaw),
 		Herdr:               HerdrOptions{SocketPath: herdrSocket, Session: herdrSession, Bin: herdrBin},
 		Mattermost:          MattermostOptions{Enabled: mmURL != "" && mmToken != "", URL: mmURL, BotToken: mmToken, AttachmentDir: mmAttachmentDir, BotUserID: mmBotUserID},
 		Gmail:               GmailOptions{Enabled: gmailJSON != "" || gmailFile != "", AccountsJSON: gmailJSON, AccountsFile: gmailFile, AttachmentDir: gmailAttachmentDir, PollInterval: gmailPoll},

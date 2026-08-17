@@ -140,6 +140,40 @@ window, and any harness whose composer this build does not read. Closing those n
 non-keystroke delivery path into the running session, which herdr's socket API does not
 offer.
 
+A held message is otherwise invisible, so the first hold also raises a herdr toast
+(`notification.show`, one per hold, never repeated while the same pane stays held). A
+headless session answers `no_foreground_client`, which is logged and is not an error;
+`COURIER_DRAFT_NOTIFY=0` turns the toast off without touching the guard.
+
+### The inbox and delivery control
+
+`GET /inbox` is the open queue as a human needs to read it — the unhandled pending and
+dispatched rows for this target, oldest first, each with connector, sender, age, attempt
+count and the same bounded preview the envelope carries, plus the live `draft_hold` and
+`paused` state. It settles nothing: an unanswered message cannot be dismissed from a list.
+
+`POST /kick` runs one tick now and answers `{"ok":true,"busy":…,"outcomes":N}`; `busy` means
+another tick already holds the serialization lock, not a failure. `POST /pause` with
+`{"paused":true|false}` stops or resumes claiming, and resuming delivers immediately instead
+of waiting for the next tick. A paused dispatcher claims nothing and burns no attempt; pause
+is process-lifetime state, so restarting courier resumes delivery.
+
+The CLI wraps those three for humans and for herdr plugin actions:
+
+```sh
+courier inbox                     # render the queue; [enter] refresh [d] deliver now [p] pause [q] quit
+courier kick                      # dispatch now
+courier kick --if-pane-matches    # herdr event hook: kick only when the hold names $HERDR_PLUGIN_EVENT_JSON's pane
+courier pause --toggle            # also --on / --off
+courier plugin-probe              # startup reachability check; always exits 0
+```
+
+They reach the daemon at `COURIER_HOST_URL` (default `http://127.0.0.1:8788`) and need no
+agent identity. [`plugin/`](./plugin) packages them as a herdr plugin: `herdr plugin link
+./plugin` gives a `prefix+i` inbox popup, the toast, deliver-now/pause actions, and the
+`pane.agent_status_changed` hook that lands a held message about a second after you submit
+your own prompt instead of up to `COURIER_TICK_MS` later.
+
 ## Requirements
 
 - Go 1.25+ (or [mise](https://mise.jdx.dev), which pins the toolchain in `mise.toml`)
@@ -178,6 +212,8 @@ Core options (every `COURIER_*` name also accepts its legacy `CHANNEL_*` spellin
 | `COURIER_CONNECTORS` | inferred | Comma-separated connector allowlist. |
 | `COURIER_ENVELOPE_PREVIEW` | on | Include the bounded one-line preview in `<msg>`. |
 | `COURIER_DRAFT_GUARD` | on | Hold dispatch while the target pane's composer holds unsent human input. |
+| `COURIER_DRAFT_NOTIFY` | on | Raise a herdr toast the first time a delivery is held behind a draft. |
+| `COURIER_HOST_URL` | `http://127.0.0.1:8788` | Daemon IPC base URL used by `inbox`/`kick`/`pause`/`plugin-probe` and the MCP shim. |
 | `COURIER_SHADOW` | off | Ingest and observe without prompts, replies, typing, or settlement. |
 | `COURIER_SHADOW_HEARTBEAT_MS` | `900000` | Shadow health log cadence; `0` disables it. |
 | `COURIER_REDELIVER_GRACE_MS` | `300000` | Base redelivery backoff. |

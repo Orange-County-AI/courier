@@ -41,6 +41,7 @@ type Driver interface {
 	SendKeys(ctx context.Context, paneID string, keys []string) bool
 	PaneRead(ctx context.Context, paneID string, lines int) (string, error)
 	PaneScreen(ctx context.Context, paneID string) (string, error)
+	Notify(ctx context.Context, title, body string) error
 }
 
 type AgentSession struct {
@@ -677,4 +678,30 @@ func (d *SocketDriver) paneReadText(ctx context.Context, paneID string, params m
 		return "", fmt.Errorf("herdr pane read %s: unexpected %q response", paneID, response.Type)
 	}
 	return response.Read.Text, nil
+}
+
+// Notify raises a herdr toast. herdr caps the title at 80 and the body at 240
+// characters and rate limits to one per second, and answers with why it did or
+// did not show: `disabled`, `rate_limited`, `no_foreground_client` (a headless
+// session — correct, not an error) and `busy` are all successful calls. Only a
+// transport failure is an error, because a notification is an extra, never the
+// mechanism that protects anything.
+func (d *SocketDriver) Notify(ctx context.Context, title, body string) error {
+	raw, err := d.call(ctx, "notification.show", map[string]any{
+		"title": title,
+		"body":  body,
+		"sound": "none",
+	}, socketIOTimeout)
+	if err != nil {
+		return fmt.Errorf("herdr notification show: %w", err)
+	}
+	var response struct {
+		Shown  bool   `json:"shown"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return fmt.Errorf("herdr notification show: %w", err)
+	}
+	d.log(fmt.Sprintf("notification shown=%t reason=%s", response.Shown, response.Reason))
+	return nil
 }

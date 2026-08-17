@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-const courierVersion = "0.2.0"
+const courierVersion = "0.3.0"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -26,6 +26,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runServe(args[1:], stderr)
 	case "mcp":
 		return runMCP(args[1:], stderr)
+	case "inbox":
+		return runInboxCommand(args[1:], stdout)
+	case "kick":
+		return runKick(args[1:], stdout)
+	case "pause":
+		return runPause(args[1:], stdout)
+	case "plugin-probe":
+		return runPluginProbe(args[1:], stdout, stderr)
 	case "version":
 		if len(args) != 1 {
 			printUsage(stderr)
@@ -40,7 +48,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: courier <serve|mcp|version>")
+	fmt.Fprintln(w, "usage: courier <serve|mcp|inbox|kick|pause|plugin-probe|version>")
 	fmt.Fprintln(w, "       courier import  (reserved)")
 }
 

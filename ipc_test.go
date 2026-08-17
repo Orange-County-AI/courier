@@ -230,7 +230,7 @@ func TestIPCHealthExactExternalKeySetAndNullMetrics(t *testing.T) {
 	wantKeys := []string{
 		"connectors", "draft_hold_at", "draft_hold_pane", "events", "host_tools", "ok",
 		"oldest_unread_age_s", "org", "read_unconfirmed", "reconcile", "reconcile_at",
-		"reconcile_source", "shadow", "target", "unposted_replies", "unread",
+		"reconcile_source", "shadow", "paused", "target", "unposted_replies", "unread",
 	}
 	sort.Strings(wantKeys)
 	if !reflect.DeepEqual(gotKeys, wantKeys) {
@@ -274,5 +274,174 @@ func TestListenIPCUnixRoundTrip(t *testing.T) {
 	response, body := ipcRequest(t, client, http.MethodGet, "http://unix/manifest", nil)
 	if response.StatusCode != 200 || body["protocol"] != float64(2) {
 		t.Fatalf("unix manifest = %d %#v", response.StatusCode, body)
+	}
+}
+
+// ipcPluginHandler wires the three plugin routes onto the hosttools harness with
+// recording closures, so the tests assert the HTTP contract the pane depends on
+// rather than the daemon's internals.
+type ipcPluginRecorder struct {
+	inbox     InboxState
+	inboxErr  error
+	kick      KickResult
+	kicks     int
+	paused    bool
+	pauseSets []bool
+	resumes   int
+}
+
+func ipcPluginHandler(t *testing.T, h *hosttoolsHarness, rec *ipcPluginRecorder) http.Handler {
+	t.Helper()
+	handler, err := NewIPCHandler(IPCOptions{
+		Store:    h.store,
+		Manifest: func() (Manifest, error) { return Manifest{Name: "courier-test"}, nil },
+		CallTool: func(context.Context, string, map[string]any) (ToolResult, error) {
+			return ToolResult{}, errors.New("no tools in this harness")
+		},
+		Health: func() HealthState {
+			return HealthState{Org: "test-org", Target: h.target, Paused: rec.paused}
+		},
+		Inbox: func(context.Context) (InboxState, error) {
+			if rec.inboxErr != nil {
+				return InboxState{}, rec.inboxErr
+			}
+			state := rec.inbox
+			state.Paused = rec.paused
+			return state, nil
+		},
+		Kick: func(context.Context) (KickResult, error) {
+			rec.kicks++
+			return rec.kick, nil
+		},
+		Pause: func(_ context.Context, paused bool) (bool, error) {
+			rec.pauseSets = append(rec.pauseSets, paused)
+			rec.paused = paused
+			if !paused {
+				rec.resumes++
+			}
+			return rec.paused, nil
+		},
+		Now: func() int64 { return h.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handler
+}
+
+func ipcPluginBase(t *testing.T, h *hosttoolsHarness, rec *ipcPluginRecorder) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startIPCServer(t, listener, ipcPluginHandler(t, h, rec))
+	return "http://" + listener.Addr().String()
+}
+
+func TestIPCInboxEchoesOpenQueueHoldAndPause(t *testing.T) {
+	h := newHosttoolsHarness(t, false)
+	rec := &ipcPluginRecorder{
+		paused: true,
+		inbox: InboxState{
+			Target:    h.target,
+			DraftHold: &DraftHold{PaneID: "w7V:p1", Agent: "omp", At: 1786943678814},
+			Rows: []InboxRow{{
+				DeliveryID: "d-1", EventID: 12, Status: "pending", Connector: "mattermost",
+				ConversationID: "channel-7:thread-9", User: "Dana", AttemptCount: 0,
+				Read: false, CreatedAt: 1786940000000, Preview: "Can you check the batch",
+			}},
+		},
+	}
+	response, body := ipcRequest(t, http.DefaultClient, http.MethodGet, ipcPluginBase(t, h, rec)+"/inbox", nil)
+	if response.StatusCode != 200 || body["ok"] != true || body["target"] != h.target || body["paused"] != true {
+		t.Fatalf("inbox = %d %#v", response.StatusCode, body)
+	}
+	hold, ok := body["draft_hold"].(map[string]any)
+	if !ok || hold["pane_id"] != "w7V:p1" || hold["agent"] != "omp" {
+		t.Fatalf("draft_hold = %#v", body["draft_hold"])
+	}
+	rows, ok := body["rows"].([]any)
+	if !ok || len(rows) != 1 {
+		t.Fatalf("rows = %#v", body["rows"])
+	}
+	row, ok := rows[0].(map[string]any)
+	if !ok {
+		t.Fatalf("row = %#v", rows[0])
+	}
+	for key, want := range map[string]any{
+		"delivery_id": "d-1", "event_id": float64(12), "status": "pending",
+		"connector": "mattermost", "conversation_id": "channel-7:thread-9", "user": "Dana",
+		"attempt_count": float64(0), "read": false, "created_at": float64(1786940000000),
+		"preview": "Can you check the batch", "last_error": nil,
+	} {
+		if row[key] != want {
+			t.Errorf("row[%s] = %#v, want %#v", key, row[key], want)
+		}
+	}
+}
+
+func TestIPCInboxSerializesAnEmptyQueueAsAList(t *testing.T) {
+	h := newHosttoolsHarness(t, false)
+	rec := &ipcPluginRecorder{inbox: InboxState{Target: h.target}}
+	_, body := ipcRequest(t, http.DefaultClient, http.MethodGet, ipcPluginBase(t, h, rec)+"/inbox", nil)
+	rows, ok := body["rows"].([]any)
+	if !ok || len(rows) != 0 {
+		t.Fatalf("rows = %#v, want an empty list rather than null", body["rows"])
+	}
+	if body["draft_hold"] != nil {
+		t.Fatalf("draft_hold = %#v, want explicit null", body["draft_hold"])
+	}
+}
+
+func TestIPCKickReportsOutcomesAndBusy(t *testing.T) {
+	h := newHosttoolsHarness(t, false)
+	rec := &ipcPluginRecorder{kick: KickResult{Outcomes: 1}}
+	base := ipcPluginBase(t, h, rec)
+
+	// No body at all: a kick carries no arguments.
+	response, body := ipcRequest(t, http.DefaultClient, http.MethodPost, base+"/kick", nil)
+	if response.StatusCode != 200 || body["ok"] != true || body["busy"] != false || body["outcomes"] != float64(1) {
+		t.Fatalf("kick = %d %#v", response.StatusCode, body)
+	}
+	if rec.kicks != 1 {
+		t.Fatalf("tick closure calls = %d, want 1", rec.kicks)
+	}
+
+	rec.kick = KickResult{Busy: true}
+	_, body = ipcRequest(t, http.DefaultClient, http.MethodPost, base+"/kick", nil)
+	if body["ok"] != true || body["busy"] != true || body["outcomes"] != float64(0) {
+		t.Fatalf("busy kick = %#v", body)
+	}
+}
+
+func TestIPCPauseFlipsStateAndRejectsNonBooleans(t *testing.T) {
+	h := newHosttoolsHarness(t, false)
+	rec := &ipcPluginRecorder{}
+	base := ipcPluginBase(t, h, rec)
+
+	response, body := ipcRequest(t, http.DefaultClient, http.MethodPost, base+"/pause", map[string]any{"paused": true})
+	if response.StatusCode != 200 || body["ok"] != true || body["paused"] != true {
+		t.Fatalf("pause = %d %#v", response.StatusCode, body)
+	}
+	if _, health := ipcRequest(t, http.DefaultClient, http.MethodGet, base+"/health", nil); health["paused"] != true {
+		t.Fatalf("health paused = %#v", health["paused"])
+	}
+
+	response, body = ipcRequest(t, http.DefaultClient, http.MethodPost, base+"/pause", map[string]any{"paused": "yes"})
+	if response.StatusCode != 400 || body["error"] != "paused must be a boolean" {
+		t.Fatalf("non-boolean pause = %d %#v", response.StatusCode, body)
+	}
+	response, body = ipcRequest(t, http.DefaultClient, http.MethodPost, base+"/pause", map[string]any{})
+	if response.StatusCode != 400 || body["error"] != "paused must be a boolean" {
+		t.Fatalf("missing pause = %d %#v", response.StatusCode, body)
+	}
+
+	// Resume must deliver now rather than at the next tick.
+	if _, body = ipcRequest(t, http.DefaultClient, http.MethodPost, base+"/pause", map[string]any{"paused": false}); body["paused"] != false {
+		t.Fatalf("resume = %#v", body)
+	}
+	if !reflect.DeepEqual(rec.pauseSets, []bool{true, false}) || rec.resumes != 1 {
+		t.Fatalf("pause calls = %#v resumes = %d", rec.pauseSets, rec.resumes)
 	}
 }
