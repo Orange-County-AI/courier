@@ -157,7 +157,38 @@ func serveBuildConnectors(store *Store, opts ServeOptions, logf serveLogFunc) (*
 			},
 		},
 	}
+	ingestCandidates, err := serveIngestCandidates(store, opts, logf)
+	if err != nil {
+		return nil, nil, err
+	}
+	candidates = append(candidates, ingestCandidates...)
 	return serveActivateConnectors(opts.Connectors, candidates, logf)
+}
+
+// serveIngestCandidates turns every declared courier.ingest/1 source into its own
+// connector candidate: COURIER_CONNECTORS then names a third-party source exactly
+// like a built-in, and the agent sees the source name as connector= on the
+// envelope. They share one loopback listener, reference counted by Start/Stop.
+func serveIngestCandidates(store *Store, opts ServeOptions, logf serveLogFunc) ([]serveConnectorCandidate, error) {
+	sources, active, err := LoadIngestSources(opts.Ingest)
+	if err != nil || !active {
+		return nil, err
+	}
+	host, err := NewIngestHost(IngestHostConfig{
+		Port: opts.Ingest.ListenPort, Store: store, Target: opts.Target, Shadow: opts.Shadow, Log: logf,
+	})
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]serveConnectorCandidate, 0, len(sources))
+	for _, source := range sources {
+		candidates = append(candidates, serveConnectorCandidate{
+			name:    source.Source,
+			enabled: true,
+			build:   func() (Connector, error) { return host.Add(source) },
+		})
+	}
+	return candidates, nil
 }
 
 // serveActivateConnectors makes an explicit connector allowlist authoritative.

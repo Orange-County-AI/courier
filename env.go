@@ -52,6 +52,15 @@ type KaneoOptions struct {
 	WorkspaceID   string
 	BotActor      string
 }
+
+// IngestOptions configures the generic courier.ingest/1 host: one loopback
+// listener plus the declared third-party sources (spec/ingest-1.md).
+type IngestOptions struct {
+	Enabled     bool
+	ListenPort  int
+	SourcesJSON string
+	SourcesFile string
+}
 type TelegramOptions struct {
 	Enabled             bool
 	ListenPort          int
@@ -92,6 +101,7 @@ type ServeOptions struct {
 	Gmail               GmailOptions
 	Telegram            TelegramOptions
 	Kaneo               KaneoOptions
+	Ingest              IngestOptions
 }
 
 type MCPOptions struct {
@@ -320,6 +330,23 @@ func serveOptionsFromEnv(lookup envLookup, warn func(string)) (ServeOptions, err
 		kaneo.BotActor, _ = value("KANEO_BOT_ACTOR")
 	}
 
+	ingestPortRaw, ingestPortSet := value("COURIER_INGEST_LISTEN_PORT")
+	ingest := IngestOptions{}
+	if ingestPortSet && ingestPortRaw != "" {
+		ingest.Enabled = true
+		ingest.ListenPort, err = parseInt("COURIER_INGEST_LISTEN_PORT", ingestPortRaw, 1, 65535)
+		if err != nil {
+			return ServeOptions{}, err
+		}
+		ingest.SourcesJSON, _ = value("COURIER_INGEST_SOURCES_JSON")
+		ingest.SourcesFile, _ = value("COURIER_INGEST_SOURCES_FILE")
+		if ingest.SourcesJSON == "" && ingest.SourcesFile == "" {
+			return ServeOptions{}, fmt.Errorf(
+				"ingest host is partially configured — missing COURIER_INGEST_SOURCES_JSON or COURIER_INGEST_SOURCES_FILE",
+			)
+		}
+	}
+
 	herdrSocket, _ := value("HERDR_SOCKET_PATH")
 	herdrSession, _ := value("HERDR_SESSION")
 	herdrBin, _ := value("HERDR_BIN")
@@ -348,6 +375,7 @@ func serveOptionsFromEnv(lookup envLookup, warn func(string)) (ServeOptions, err
 		Gmail:               GmailOptions{Enabled: gmailJSON != "" || gmailFile != "", AccountsJSON: gmailJSON, AccountsFile: gmailFile, AttachmentDir: gmailAttachmentDir, PollInterval: gmailPoll},
 		Telegram:            telegram,
 		Kaneo:               kaneo,
+		Ingest:              ingest,
 	}, nil
 }
 

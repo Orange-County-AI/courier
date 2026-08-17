@@ -2,13 +2,14 @@
 
 Courier is a generic bi-directional gateway between external chat applications and [herdr](https://herdr.dev)-driven coding agents. Each external message becomes a durable row in a SQLite ledger; courier delivers a bounded pointer to the agent, the agent reads and answers through MCP tools, and courier posts the reply back to the exact conversation it came from. Unanswered messages are redelivered until they are settled — by design, an agent can never silently drop a message.
 
-One Go binary, three subcommands:
+One Go binary, four subcommands:
 
 - `courier serve` — the daemon: SQLite ledger, connector ingestion, ordered dispatch through herdr's socket API, HTTP/unix IPC, reply posting, redelivery, and a shadow observation mode.
 - `courier mcp` — per-session stdio MCP shim. It fetches the daemon's manifest and forwards tool calls; it does not deliver messages itself.
+- `courier push` — reference signer that POSTs a `courier.ingest/1` event for an integration smoke test.
 - `courier version` — binary version.
 
-Supported connectors: **Mattermost**, **Gmail**, **Telegram**, and **Kaneo** (webhook-based project tracker events). Courier is connector-agnostic at its core: a connector only needs to normalize events into the ledger and post replies.
+Supported connectors: **Mattermost**, **Gmail**, **Telegram**, and **Kaneo** (webhook-based project tracker events). Courier also takes events from any third-party integration over the [`courier.ingest/1` wire spec](./spec/ingest-1.md): signed HTTP in, signed reply callback out, with no Go code or rebuild needed. Courier is connector-agnostic at its core: a connector only needs to normalize events into the ledger and post replies.
 
 ## How it works
 
@@ -18,6 +19,7 @@ Supported connectors: **Mattermost**, **Gmail**, **Telegram**, and **Kaneo** (we
 ┌─────────────────────────── external applications ──────────────────────────┐
 │  Mattermost (websocket)   Gmail (historyId poll)   Telegram / Kaneo        │
 │                          (webhooks, loopback listener)                     │
+│  your integration: signed HTTP, POST /ingest/{source}  (courier.ingest/1)  │
 └──────────────────────────────────┬─────────────────────────────────────────┘
                                    ▼  push or pull, per connector
 ┌─────────────────────────────── courier serve ──────────────────────────────┐
@@ -170,6 +172,16 @@ courier pause --toggle            # also --on / --off
 courier plugin-probe              # startup reachability check; always exits 0
 ```
 
+`courier push` signs and POSTs a `courier.ingest/1` event. It is the reference signer and the conformance smoke test for a new integration:
+
+```sh
+courier push --source sentry --conversation sentry:issue:4182 \
+  --event-key sentry:issue:4182:event:99137 --user sentry --trigger alert \
+  --content 'TypeError: cannot read property "id" of undefined'
+```
+
+It uses the source secret from its declaration or `COURIER_INGEST_SECRET`, and sends to `COURIER_INGEST_URL` or the local ingest listener; no secret is accepted on the command line.
+
 They reach the daemon at `COURIER_HOST_URL` (default `http://127.0.0.1:8788`) and need no
 agent identity. [`plugin/`](./plugin) packages them as a herdr plugin: `herdr plugin link
 ./plugin` gives a `prefix+i` inbox popup, the toast, deliver-now/pause actions, and the
@@ -271,6 +283,29 @@ export KANEO_API_BASE=https://kaneo.example.com
 export KANEO_BOT_KEY=...
 # optional: KANEO_WORKSPACE_ID, KANEO_BOT_ACTOR
 ```
+
+**Ingest** (third-party integrations over [`courier.ingest/1`](./spec/ingest-1.md)):
+
+```sh
+export COURIER_INGEST_LISTEN_PORT=8791
+export COURIER_INGEST_SOURCES_FILE=/run/secrets/courier-ingest-sources.json
+# or: COURIER_INGEST_SOURCES_JSON='[...]'
+```
+
+The sources value is a JSON array of declarations:
+
+```json
+[
+  {
+    "source": "sentry",
+    "secret": "…",
+    "reply_url": "http://127.0.0.1:9114/courier/reply",
+    "instructions": "Sentry alerts arrive with connector=\"sentry\"."
+  }
+]
+```
+
+Each declared source becomes its own connector, so `COURIER_CONNECTORS` names it like a built-in and the agent sees `connector="<source>"`. A source without `reply_url` is one-way; `chat_reply` is refused for it and the agent must use `mark_handled` instead. The listener is loopback-only, so front it with your own tunnel or TLS-terminating reverse proxy. See the [wire spec](./spec/ingest-1.md) for source declarations and wire details.
 
 Secrets belong in environment injection, never command arguments.
 

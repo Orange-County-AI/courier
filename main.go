@@ -32,6 +32,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runKick(args[1:], stdout)
 	case "pause":
 		return runPause(args[1:], stdout)
+	case "push":
+		return runPush(args[1:], stdout)
 	case "plugin-probe":
 		return runPluginProbe(args[1:], stdout, stderr)
 	case "version":
@@ -48,7 +50,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: courier <serve|mcp|inbox|kick|pause|plugin-probe|version>")
+	fmt.Fprintln(w, "usage: courier <serve|mcp|push|inbox|kick|pause|plugin-probe|version>")
 	fmt.Fprintln(w, "       courier import  (reserved)")
 }
 

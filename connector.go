@@ -55,6 +55,14 @@ type unavailableNotifier interface {
 	NotifyUnavailable(context.Context, DeliveryContext) error
 }
 
+// replyRefuser is optional. A connector implements it when a delivery has no
+// answer channel at all, so chat_reply is refused before a reply row exists:
+// a recorded reply nobody can post would otherwise be retried forever while the
+// delivery never settles.
+type replyRefuser interface {
+	RefuseReply(DeliveryContext) string
+}
+
 type Registry struct {
 	mu         sync.RWMutex
 	byName     map[string]Connector
