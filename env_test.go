@@ -183,8 +183,10 @@ func TestRunVersionAndUnknownUsage(t *testing.T) {
 	if err := run([]string{"version"}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	if got := stdout.String(); got != courierVersion+"\n" {
-		t.Fatalf("version output = %q", got)
+	// The reported version names the build, not just the semver: this fleet has
+	// run three different binaries that all claimed 0.1.0.
+	if got := stdout.String(); got != buildVersion()+"\n" || !strings.HasPrefix(got, courierVersion+" (") {
+		t.Fatalf("version output = %q, want %q", got, buildVersion())
 	}
 	stdout.Reset()
 	stderr.Reset()

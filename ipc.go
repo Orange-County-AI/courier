@@ -72,6 +72,7 @@ type kickResponse struct {
 
 type healthResponse struct {
 	OK               bool     `json:"ok"`
+	Version          string   `json:"version"`
 	Events           int64    `json:"events"`
 	UnpostedReplies  int      `json:"unposted_replies"`
 	Org              string   `json:"org"`
@@ -171,6 +172,7 @@ func NewIPCHandler(opts IPCOptions) (http.Handler, error) {
 		}
 		writeJSON(w, http.StatusOK, healthResponse{
 			OK:               true,
+			Version:          buildVersion(),
 			Events:           events,
 			UnpostedReplies:  len(unposted),
 			Org:              state.Org,

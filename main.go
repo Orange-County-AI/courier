@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-const courierVersion = "0.3.2"
+const courierVersion = "0.3.3"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -39,7 +39,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 			printUsage(stderr)
 			return fmt.Errorf("version takes no arguments")
 		}
-		fmt.Fprintln(stdout, courierVersion)
+		fmt.Fprintln(stdout, buildVersion())
 		return nil
 	default:
 		printUsage(stderr)

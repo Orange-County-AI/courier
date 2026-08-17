@@ -230,7 +230,7 @@ func TestIPCHealthExactExternalKeySetAndNullMetrics(t *testing.T) {
 	wantKeys := []string{
 		"connectors", "draft_hold_at", "draft_hold_pane", "events", "host_tools", "ok",
 		"oldest_unread_age_s", "org", "read_unconfirmed", "reconcile", "reconcile_at",
-		"reconcile_source", "shadow", "paused", "target", "unposted_replies", "unread",
+		"reconcile_source", "shadow", "paused", "target", "unposted_replies", "unread", "version",
 	}
 	sort.Strings(wantKeys)
 	if !reflect.DeepEqual(gotKeys, wantKeys) {

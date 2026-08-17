@@ -337,7 +337,7 @@ func serveAssemble(ctx context.Context, opts ServeOptions, deps serveDependencie
 	runtime.dispatcher = dispatcher
 	manifest, err := BuildManifest(BuildManifestOptions{
 		Name:       "courier-" + opts.Org,
-		Version:    courierVersion,
+		Version:    buildVersion(),
 		Connectors: connectors,
 	})
 	if err != nil {
