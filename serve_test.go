@@ -81,6 +81,7 @@ type serveTestDispatcher struct {
 	drain  func(context.Context) ([]DispatchOutcome, error)
 	tick   func(context.Context) ([]DispatchOutcome, error)
 	status *TargetStatus
+	hold   *DraftHold
 }
 
 func (d *serveTestDispatcher) Start(ctx context.Context) (ReconcileResult, error) {
@@ -96,6 +97,8 @@ func (d *serveTestDispatcher) Tick(ctx context.Context) ([]DispatchOutcome, erro
 }
 
 func (d *serveTestDispatcher) TargetStatus() *TargetStatus { return d.status }
+
+func (d *serveTestDispatcher) DraftHold() *DraftHold { return d.hold }
 
 type serveTestConnector struct {
 	name  string

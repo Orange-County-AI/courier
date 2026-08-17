@@ -95,8 +95,8 @@ func TestPreviewParsingIsTypoSafe(t *testing.T) {
 		{raw: "typo", want: true},
 		{raw: "1", want: true},
 	} {
-		if got := parsePreview(test.raw); got != test.want {
-			t.Errorf("parsePreview(%q) = %t, want %t", test.raw, got, test.want)
+		if got := parseDefaultOn(test.raw); got != test.want {
+			t.Errorf("parseDefaultOn(%q) = %t, want %t", test.raw, got, test.want)
 		}
 	}
 }

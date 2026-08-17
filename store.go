@@ -622,6 +622,25 @@ func (s *Store) DeliveriesForTarget(target string) ([]Delivery, error) {
 	return deliveries, rows.Err()
 }
 
+// HasClaimable answers the exact selection ClaimNext would make, without
+// claiming it. The draft guard needs to know there is work before it pays for a
+// pane read, and must not burn an attempt to find out.
+func (s *Store) HasClaimable(target string) (bool, error) {
+	var present int
+	err := s.db.QueryRow(`
+        SELECT 1 FROM deliveries d
+        JOIN events e ON e.id = d.event_id
+        WHERE d.target = ? AND d.status = 'pending' AND e.handled_at IS NULL
+        LIMIT 1`, target).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) ClaimNext(target string, now int64, sessionGeneration *int64) (*Deliverable, error) {
 	query := `
         UPDATE deliveries SET

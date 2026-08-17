@@ -24,6 +24,8 @@ type HealthState struct {
 	Reconcile       *string
 	ReconcileAt     *int64
 	ReconcileSource *string
+	DraftHoldPane   *string
+	DraftHoldAt     *int64
 }
 
 type healthResponse struct {
@@ -38,6 +40,8 @@ type healthResponse struct {
 	Reconcile        *string  `json:"reconcile"`
 	ReconcileAt      *int64   `json:"reconcile_at"`
 	ReconcileSource  *string  `json:"reconcile_source"`
+	DraftHoldPane    *string  `json:"draft_hold_pane"`
+	DraftHoldAt      *int64   `json:"draft_hold_at"`
 	Unread           int64    `json:"unread"`
 	OldestUnreadAgeS *int64   `json:"oldest_unread_age_s"`
 	ReadUnconfirmed  int64    `json:"read_unconfirmed"`
@@ -119,6 +123,8 @@ func NewIPCHandler(opts IPCOptions) (http.Handler, error) {
 			Reconcile:        state.Reconcile,
 			ReconcileAt:      state.ReconcileAt,
 			ReconcileSource:  state.ReconcileSource,
+			DraftHoldPane:    state.DraftHoldPane,
+			DraftHoldAt:      state.DraftHoldAt,
 			Unread:           stats.Unread,
 			OldestUnreadAgeS: stats.OldestUnreadAgeS,
 			ReadUnconfirmed:  stats.ReadUnconfirmed,

@@ -93,7 +93,9 @@ func TestDispatchFailureReconcilesThenStops(t *testing.T) {
 			if getTestEvent(t, h.Store, first.EventID).HandledAt != nil {
 				t.Fatal("failed prompt handled the event")
 			}
-			wantCalls := []string{"prompt:" + h.Target, "getAgent:" + h.Target}
+			// The draft guard resolves the target and reads its pane before it
+			// claims, so a dispatch is preceded by exactly one of each.
+			wantCalls := []string{"getAgent:" + h.Target, "paneScreen:w1:p1", "prompt:" + h.Target, "getAgent:" + h.Target}
 			if calls := h.Driver.CallLog(); !reflect.DeepEqual(calls, wantCalls) {
 				t.Fatalf("calls = %v, want %v", calls, wantCalls)
 			}
@@ -366,8 +368,10 @@ func TestSuccessfulDispatchRefreshesTargetStatus(t *testing.T) {
 			getCalls++
 		}
 	}
-	if getCalls != 1 {
-		t.Fatalf("GetAgent calls = %d, want startup reconcile only", getCalls)
+	// Startup reconcile plus the draft guard's pane resolution. A third call
+	// would mean the successful dispatch re-reconciled the target.
+	if getCalls != 2 {
+		t.Fatalf("GetAgent calls = %d, want startup reconcile and draft guard only", getCalls)
 	}
 }
 
@@ -441,5 +445,89 @@ func TestToolCallDuringDrainDoesNotSettle(t *testing.T) {
 	}
 	if event := getTestEvent(t, h.Store, row.EventID); event.HandledAt != nil {
 		t.Fatal("read during drain settled the event")
+	}
+}
+
+func TestDraftGuardHoldsDispatchUntilComposerClears(t *testing.T) {
+	h := dispatchNewHarness(t)
+	row := h.Enqueue(t, DispatchEnqueueInput{Key: "e1", Content: "hello?"})
+	h.Driver.PaneScreens = map[string]string{"w1:p1": readScreenFixture(t, "claude-draft.txt")}
+
+	outcomes, err := h.Dispatcher.Drain(context.Background())
+	if err != nil || len(outcomes) != 0 {
+		t.Fatalf("held Drain = %#v, %v", outcomes, err)
+	}
+	if prompts := h.Driver.PromptLog(); len(prompts) != 0 {
+		t.Fatalf("prompted into a draft: %#v", prompts)
+	}
+	// A hold is not a failed attempt: the row keeps its place, its attempt
+	// count, and a clean last_error, so the envelope is not marked redelivered.
+	delivery := getTestDelivery(t, h.Store, row.DeliveryID)
+	if delivery.Status != DeliveryPending || delivery.AttemptCount != 0 || delivery.LastError != nil || delivery.LastDispatchedAt != nil {
+		t.Fatalf("held delivery = %#v", delivery)
+	}
+	hold := h.Dispatcher.DraftHold()
+	if hold == nil || hold.PaneID != "w1:p1" || hold.Agent != "claude" || hold.At != h.Clock.Now() {
+		t.Fatalf("hold = %#v", hold)
+	}
+
+	h.Driver.PaneScreens["w1:p1"] = readScreenFixture(t, "claude-empty.txt")
+	outcomes, err = h.Dispatcher.Drain(context.Background())
+	if err != nil || len(outcomes) != 1 || !outcomes[0].OK {
+		t.Fatalf("resumed Drain = %#v, %v", outcomes, err)
+	}
+	if prompts := h.Driver.PromptLog(); len(prompts) != 1 || !strings.Contains(prompts[0].Text, `redelivery="0"`) {
+		t.Fatalf("prompts = %#v", prompts)
+	}
+	if hold := h.Dispatcher.DraftHold(); hold != nil {
+		t.Fatalf("hold survived a clear composer: %#v", hold)
+	}
+}
+
+func TestDraftGuardReadsNoPaneWithAnEmptyQueue(t *testing.T) {
+	h := dispatchNewHarness(t)
+	h.Driver.PaneScreens = map[string]string{"w1:p1": readScreenFixture(t, "claude-draft.txt")}
+
+	if outcomes, err := h.Dispatcher.Drain(context.Background()); err != nil || len(outcomes) != 0 {
+		t.Fatalf("Drain = %#v, %v", outcomes, err)
+	}
+	if calls := h.Driver.CallLog(); len(calls) != 0 {
+		t.Fatalf("guard called herdr with nothing to deliver: %v", calls)
+	}
+}
+
+func TestDraftGuardDispatchesWhenTheScreenIsUnreadable(t *testing.T) {
+	h := dispatchNewHarness(t)
+	h.Enqueue(t, DispatchEnqueueInput{Key: "e1", Content: "hello?"})
+	h.Driver.PaneScreenErr = errors.New("pane read failed")
+
+	outcomes, err := h.Dispatcher.Drain(context.Background())
+	if err != nil || len(outcomes) != 1 || !outcomes[0].OK {
+		t.Fatalf("Drain = %#v, %v", outcomes, err)
+	}
+	if hold := h.Dispatcher.DraftHold(); hold != nil {
+		t.Fatalf("guard held on its own read failure: %#v", hold)
+	}
+}
+
+func TestDraftGuardOffDispatchesIntoADraft(t *testing.T) {
+	h := dispatchNewHarness(t)
+	h.Enqueue(t, DispatchEnqueueInput{Key: "e1", Content: "hello?"})
+	h.Driver.PaneScreens = map[string]string{"w1:p1": readScreenFixture(t, "claude-draft.txt")}
+	guard := false
+	dispatcher, err := NewDispatcher(DispatcherOptions{
+		Store: h.Store, Driver: h.Driver, Target: h.Target, OrgID: h.OrgID,
+		PromptTimeout: 5 * time.Second, Now: h.Clock.Now, DraftGuard: &guard,
+	})
+	if err != nil {
+		t.Fatalf("NewDispatcher: %v", err)
+	}
+
+	outcomes, err := dispatcher.Drain(context.Background())
+	if err != nil || len(outcomes) != 1 || !outcomes[0].OK {
+		t.Fatalf("Drain = %#v, %v", outcomes, err)
+	}
+	if calls := h.Driver.CallLog(); len(calls) != 1 || calls[0] != "prompt:"+h.Target {
+		t.Fatalf("calls = %v, want the prompt only", calls)
 	}
 }

@@ -67,6 +67,11 @@ type FakeDriver struct {
 	PromptStarted      chan struct{}
 	PromptRelease      <-chan struct{}
 
+	// PaneScreens is keyed by pane id; a missing pane keeps the default "not
+	// configured" error so tests that predate the draft guard still dispatch.
+	PaneScreens   map[string]string
+	PaneScreenErr error
+
 	currentPrompts       int
 	MaxConcurrentPrompts int
 }
@@ -204,6 +209,20 @@ func (d *FakeDriver) SendKeys(context.Context, string, []string) bool { return f
 
 func (d *FakeDriver) PaneRead(context.Context, string, int) (string, error) {
 	return "", errors.New("fake pane read not configured")
+}
+
+func (d *FakeDriver) PaneScreen(_ context.Context, paneID string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.Calls = append(d.Calls, "paneScreen:"+paneID)
+	if d.PaneScreenErr != nil {
+		return "", d.PaneScreenErr
+	}
+	screen, ok := d.PaneScreens[paneID]
+	if !ok {
+		return "", errors.New("fake pane screen not configured")
+	}
+	return screen, nil
 }
 
 func (d *FakeDriver) CallLog() []string {

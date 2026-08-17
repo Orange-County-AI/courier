@@ -116,6 +116,30 @@ backoff — and an explicit banner telling the agent whether it previously read 
 settled the message. A failed outbound post is retried by courier, not the agent: a
 repeat `chat_reply` is recognized as a duplicate and never double-posts.
 
+### The draft guard
+
+herdr's `agent.prompt` is a keystroke transport, not a queue: it writes the prompt at the
+pane's cursor and presses Enter a beat later. A pane whose composer already holds a
+human's unsent keystrokes therefore submits draft+message as one prompt — the human's
+half-typed sentence goes to their own agent, and the delivered message is corrupted by
+whatever preceded it.
+
+So before it claims a delivery, courier reads the target pane's rendered screen and looks
+for unsent input in the harness composer (omp and Claude Code are recognized). On a
+draft, the drain stops before claiming: nothing is written to the pane, the row keeps its
+place and its attempt count, `GET /health` reports `draft_hold_pane`, and one log line
+says dispatch is held. The next tick after the composer clears delivers it.
+
+Detection is one-sided on purpose. An unfamiliar harness, a composer it cannot locate, or
+a failed pane read dispatches exactly as it did before the guard, because starving a
+durable queue is worse than the clobber the guard prevents. `COURIER_DRAFT_GUARD=0`
+turns it off.
+
+What it cannot cover: a human who starts typing inside herdr's own paste-then-Enter
+window, and any harness whose composer this build does not read. Closing those needs a
+non-keystroke delivery path into the running session, which herdr's socket API does not
+offer.
+
 ## Requirements
 
 - Go 1.25+ (or [mise](https://mise.jdx.dev), which pins the toolchain in `mise.toml`)
@@ -153,6 +177,7 @@ Core options (every `COURIER_*` name also accepts its legacy `CHANNEL_*` spellin
 | `COURIER_TICK_MS` | `15000` | Sweep, reply-retry, and dispatch cadence; `0` disables ticks. |
 | `COURIER_CONNECTORS` | inferred | Comma-separated connector allowlist. |
 | `COURIER_ENVELOPE_PREVIEW` | on | Include the bounded one-line preview in `<msg>`. |
+| `COURIER_DRAFT_GUARD` | on | Hold dispatch while the target pane's composer holds unsent human input. |
 | `COURIER_SHADOW` | off | Ingest and observe without prompts, replies, typing, or settlement. |
 | `COURIER_SHADOW_HEARTBEAT_MS` | `900000` | Shadow health log cadence; `0` disables it. |
 | `COURIER_REDELIVER_GRACE_MS` | `300000` | Base redelivery backoff. |

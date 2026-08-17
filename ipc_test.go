@@ -228,14 +228,15 @@ func TestIPCHealthExactExternalKeySetAndNullMetrics(t *testing.T) {
 	}
 	sort.Strings(gotKeys)
 	wantKeys := []string{
-		"connectors", "events", "host_tools", "ok", "oldest_unread_age_s", "org", "read_unconfirmed",
-		"reconcile", "reconcile_at", "reconcile_source", "shadow", "target", "unposted_replies", "unread",
+		"connectors", "draft_hold_at", "draft_hold_pane", "events", "host_tools", "ok",
+		"oldest_unread_age_s", "org", "read_unconfirmed", "reconcile", "reconcile_at",
+		"reconcile_source", "shadow", "target", "unposted_replies", "unread",
 	}
 	sort.Strings(wantKeys)
 	if !reflect.DeepEqual(gotKeys, wantKeys) {
 		t.Fatalf("health keys = %v, want %v", gotKeys, wantKeys)
 	}
-	for _, key := range []string{"oldest_unread_age_s", "reconcile", "reconcile_at", "reconcile_source"} {
+	for _, key := range []string{"oldest_unread_age_s", "reconcile", "reconcile_at", "reconcile_source", "draft_hold_pane", "draft_hold_at"} {
 		if value, exists := body[key]; !exists || value != nil {
 			t.Errorf("missing metric %s = %#v, want explicit null", key, value)
 		}

@@ -28,6 +28,7 @@ type serveDispatcher interface {
 	Drain(context.Context) ([]DispatchOutcome, error)
 	Tick(context.Context) ([]DispatchOutcome, error)
 	TargetStatus() *TargetStatus
+	DraftHold() *DraftHold
 }
 
 type serveHTTPServer interface {
@@ -94,6 +95,7 @@ func serveDefaultDependencies() serveDependencies {
 		buildConnectors: serveBuildConnectors,
 		newDispatcher: func(store *Store, driver serveManagedDriver, connectors *Registry, opts ServeOptions, logf serveLogFunc) (serveDispatcher, error) {
 			preview := opts.EnvelopePreview
+			draftGuard := opts.DraftGuard
 			return NewDispatcher(DispatcherOptions{
 				Store:           store,
 				Driver:          driver,
@@ -101,6 +103,7 @@ func serveDefaultDependencies() serveDependencies {
 				OrgID:           opts.Org,
 				PromptTimeout:   opts.PromptTimeout,
 				EnvelopePreview: &preview,
+				DraftGuard:      &draftGuard,
 				Shadow:          opts.Shadow,
 				Connectors:      connectors,
 				Log:             func(message string) { logf("%s", message) },
@@ -242,6 +245,12 @@ func serveHealthState(opts ServeOptions, connectors []Connector, dispatcher serv
 		state.Reconcile = &action
 		state.ReconcileAt = &at
 		state.ReconcileSource = &source
+	}
+	if hold := dispatcher.DraftHold(); hold != nil {
+		pane := hold.PaneID
+		at := hold.At
+		state.DraftHoldPane = &pane
+		state.DraftHoldAt = &at
 	}
 	return state
 }

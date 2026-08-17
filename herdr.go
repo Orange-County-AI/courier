@@ -40,6 +40,7 @@ type Driver interface {
 	PaneWaitOutput(ctx context.Context, paneID, match string, timeout time.Duration, regex bool) bool
 	SendKeys(ctx context.Context, paneID string, keys []string) bool
 	PaneRead(ctx context.Context, paneID string, lines int) (string, error)
+	PaneScreen(ctx context.Context, paneID string) (string, error)
 }
 
 type AgentSession struct {
@@ -637,13 +638,28 @@ func (d *SocketDriver) PaneRead(ctx context.Context, paneID string, lines int) (
 	if lines < 0 || uint64(lines) > math.MaxUint32 {
 		return "", fmt.Errorf("herdr pane read %s: lines must fit uint32", paneID)
 	}
-	params := map[string]any{
+	return d.paneReadText(ctx, paneID, map[string]any{
 		"pane_id":    paneID,
 		"source":     "recent",
 		"format":     "text",
 		"lines":      lines,
 		"strip_ansi": true,
-	}
+	})
+}
+
+// PaneScreen returns what the human is looking at. The visible source is the
+// rendered screen including the harness composer; recent output is a scrollback
+// slice and omitting lines is required because lines=0 reads nothing.
+func (d *SocketDriver) PaneScreen(ctx context.Context, paneID string) (string, error) {
+	return d.paneReadText(ctx, paneID, map[string]any{
+		"pane_id":    paneID,
+		"source":     "visible",
+		"format":     "text",
+		"strip_ansi": true,
+	})
+}
+
+func (d *SocketDriver) paneReadText(ctx context.Context, paneID string, params map[string]any) (string, error) {
 	raw, err := d.call(ctx, "pane.read", params, socketIOTimeout)
 	if err != nil {
 		return "", fmt.Errorf("herdr pane read %s: %w", paneID, err)

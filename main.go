@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-const courierVersion = "0.1.0"
+const courierVersion = "0.2.0"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {

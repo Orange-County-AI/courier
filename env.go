@@ -85,6 +85,7 @@ type ServeOptions struct {
 	Shadow              ShadowMode
 	ShadowHeartbeat     time.Duration
 	EnvelopePreview     bool
+	DraftGuard          bool
 	Herdr               HerdrOptions
 	Mattermost          MattermostOptions
 	Gmail               GmailOptions
@@ -216,6 +217,10 @@ func serveOptionsFromEnv(lookup envLookup, warn func(string)) (ServeOptions, err
 	if err != nil {
 		return ServeOptions{}, err
 	}
+	draftGuardRaw, _, err := dual("DRAFT_GUARD")
+	if err != nil {
+		return ServeOptions{}, err
+	}
 	if _, set := lookup("CHANNEL_ENVELOPE_TODO"); set && warn != nil {
 		warn("CHANNEL_ENVELOPE_TODO is set but no longer has any effect; courier/1 has no <todo> element")
 	}
@@ -330,7 +335,8 @@ func serveOptionsFromEnv(lookup envLookup, warn func(string)) (ServeOptions, err
 		Connectors:          connectors,
 		Shadow:              NewShadowMode(parseShadow(shadowRaw)),
 		ShadowHeartbeat:     shadowHeartbeat,
-		EnvelopePreview:     parsePreview(previewRaw),
+		EnvelopePreview:     parseDefaultOn(previewRaw),
+		DraftGuard:          parseDefaultOn(draftGuardRaw),
 		Herdr:               HerdrOptions{SocketPath: herdrSocket, Session: herdrSession, Bin: herdrBin},
 		Mattermost:          MattermostOptions{Enabled: mmURL != "" && mmToken != "", URL: mmURL, BotToken: mmToken, AttachmentDir: mmAttachmentDir, BotUserID: mmBotUserID},
 		Gmail:               GmailOptions{Enabled: gmailJSON != "" || gmailFile != "", AccountsJSON: gmailJSON, AccountsFile: gmailFile, AttachmentDir: gmailAttachmentDir, PollInterval: gmailPoll},
@@ -377,7 +383,9 @@ func mcpOptionsFromEnv(lookup envLookup) (MCPOptions, error) {
 	return MCPOptions{Agent: agent, HostURL: hostURL, ManifestCacheDir: cacheDir}, nil
 }
 
-func parsePreview(raw string) bool {
+// parseDefaultOn reads a knob whose safe value is on: an unset or unparsed value
+// keeps the feature enabled, and only an explicit 0/false turns it off.
+func parseDefaultOn(raw string) bool {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "0", "false":
 		return false

@@ -17,6 +17,7 @@ type DispatcherOptions struct {
 	Log             func(string)
 	Now             func() int64
 	EnvelopePreview *bool
+	DraftGuard      *bool
 	Shadow          ShadowMode
 	Connectors      *Registry
 }
@@ -28,6 +29,15 @@ type TargetStatus struct {
 	Action ReconcileAction `json:"action"`
 	At     int64           `json:"at"`
 	Source string          `json:"source"`
+}
+
+// DraftHold is the pane evidence that stopped a drain: the human had unsent
+// input in the composer, so dispatching would have submitted their draft along
+// with the message. It is retried, never dropped.
+type DraftHold struct {
+	PaneID string `json:"pane_id"`
+	Agent  string `json:"agent"`
+	At     int64  `json:"at"`
 }
 
 type DispatchOutcome struct {
@@ -48,6 +58,7 @@ type Dispatcher struct {
 	log           func(string)
 	now           func() int64
 	previewOn     bool
+	draftGuard    bool
 	shadow        ShadowMode
 	connectors    *Registry
 
@@ -55,6 +66,7 @@ type Dispatcher struct {
 	stateMu sync.RWMutex
 	last    *ReconcileResult
 	status  *TargetStatus
+	hold    *DraftHold
 }
 
 func NewDispatcher(opts DispatcherOptions) (*Dispatcher, error) {
@@ -87,6 +99,10 @@ func NewDispatcher(opts DispatcherOptions) (*Dispatcher, error) {
 	if opts.EnvelopePreview != nil {
 		previewOn = *opts.EnvelopePreview
 	}
+	draftGuard := true
+	if opts.DraftGuard != nil {
+		draftGuard = *opts.DraftGuard
+	}
 	return &Dispatcher{
 		store:         opts.Store,
 		driver:        opts.Driver,
@@ -97,6 +113,7 @@ func NewDispatcher(opts DispatcherOptions) (*Dispatcher, error) {
 		log:           log,
 		now:           now,
 		previewOn:     previewOn,
+		draftGuard:    draftGuard,
 		shadow:        opts.Shadow,
 		connectors:    opts.Connectors,
 	}, nil
@@ -195,6 +212,18 @@ func (d *Dispatcher) TargetStatus() *TargetStatus {
 	return &status
 }
 
+// DraftHold reports the composer state that is currently holding dispatch back,
+// or nil when nothing is held.
+func (d *Dispatcher) DraftHold() *DraftHold {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	if d.hold == nil {
+		return nil
+	}
+	hold := *d.hold
+	return &hold
+}
+
 // Sweep returns unconfirmed deliveries to the queue after their read-sensitive
 // backoff. It never settles or abandons a delivery.
 func (d *Dispatcher) Sweep(now ...int64) ([]string, error) {
@@ -235,6 +264,24 @@ func (d *Dispatcher) Drain(ctx context.Context) ([]DispatchOutcome, error) {
 		if state != nil {
 			value := state.SessionGeneration
 			generation = &value
+		}
+		// The draft guard runs before ClaimNext so a held delivery keeps its
+		// place in the queue: no attempt is burned, no last_error is written,
+		// and the row stays pending for the next tick.
+		if d.draftGuard {
+			claimable, err := d.store.HasClaimable(d.target)
+			if err != nil {
+				return outcomes, fmt.Errorf("peek claimable delivery: %w", err)
+			}
+			if !claimable {
+				d.releaseDraftHold()
+				return outcomes, nil
+			}
+			if hold := d.composerHold(ctx); hold != nil {
+				d.applyDraftHold(*hold)
+				return outcomes, nil
+			}
+			d.releaseDraftHold()
 		}
 		claimed, err := d.store.ClaimNext(d.target, d.now(), generation)
 		if err != nil {
@@ -310,6 +357,45 @@ func (d *Dispatcher) Drain(ctx context.Context) ([]DispatchOutcome, error) {
 			d.notifyUnavailable(ctx, *claimed)
 		}
 		return outcomes, nil
+	}
+}
+
+// composerHold reads the target pane and reports a hold only on positive
+// evidence of unsent human input. Resolution and read failures return nil: the
+// prompt path already reports an unreachable or missing target, and a guard that
+// held on its own errors would stall a durable queue.
+func (d *Dispatcher) composerHold(ctx context.Context) *DraftHold {
+	agent, err := d.driver.GetAgent(ctx, d.target)
+	if err != nil || agent == nil || agent.PaneID == "" {
+		return nil
+	}
+	screen, err := d.driver.PaneScreen(ctx, agent.PaneID)
+	if err != nil {
+		return nil
+	}
+	if DetectComposer(agent.Agent, screen) != ComposerDraft {
+		return nil
+	}
+	return &DraftHold{PaneID: agent.PaneID, Agent: agent.Agent, At: d.now()}
+}
+
+func (d *Dispatcher) applyDraftHold(hold DraftHold) {
+	d.stateMu.Lock()
+	first := d.hold == nil || d.hold.PaneID != hold.PaneID
+	d.hold = &hold
+	d.stateMu.Unlock()
+	if first {
+		d.log(fmt.Sprintf("dispatch held — %s has unsent input in pane %s; retrying until the composer is clear", hold.Agent, hold.PaneID))
+	}
+}
+
+func (d *Dispatcher) releaseDraftHold() {
+	d.stateMu.Lock()
+	released := d.hold
+	d.hold = nil
+	d.stateMu.Unlock()
+	if released != nil {
+		d.log(fmt.Sprintf("dispatch resumed — pane %s composer is clear", released.PaneID))
 	}
 }
 
