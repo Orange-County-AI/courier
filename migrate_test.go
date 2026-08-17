@@ -169,6 +169,9 @@ func TestFreshDatabaseStartsAtCurrentSchema(t *testing.T) {
 			t.Errorf("fresh deliveries missing %s: %v", column, columns)
 		}
 	}
+	if containsString(rawColumns(t, path, "reconciler_state"), "herdr_session") {
+		t.Error("fresh reconciler_state unexpectedly has herdr_session")
+	}
 	schema := strings.Join(rawSchema(t, path), "\n")
 	for _, fragment := range []string{
 		"idx_events_connector_key", "idx_events_unhandled", "idx_deliveries_one_open", "idx_deliveries_open",
@@ -303,7 +306,7 @@ func TestNewerDatabaseIsRefusedUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := raw.Exec("PRAGMA user_version = 3"); err != nil {
+	if _, err := raw.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion+1)); err != nil {
 		raw.Close()
 		t.Fatal(err)
 	}
@@ -313,10 +316,10 @@ func TestNewerDatabaseIsRefusedUntouched(t *testing.T) {
 	if store != nil {
 		store.Close()
 	}
-	if err == nil || !strings.Contains(err.Error(), "version 3") || !strings.Contains(err.Error(), "(2)") || !strings.Contains(err.Error(), "Refusing") {
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("version %d", SchemaVersion+1)) || !strings.Contains(err.Error(), fmt.Sprintf("(%d)", SchemaVersion)) || !strings.Contains(err.Error(), "Refusing") {
 		t.Fatalf("Open newer database error = %v", err)
 	}
-	if got := rawUserVersion(t, path); got != 3 {
+	if got := rawUserVersion(t, path); got != SchemaVersion+1 {
 		t.Fatalf("refusal changed user_version to %d", got)
 	}
 	if after := rawSchema(t, path); !reflect.DeepEqual(before, after) {
@@ -334,9 +337,10 @@ func TestMigrationLogsOnlyUpgrade(t *testing.T) {
 	store.Close()
 	joined := strings.Join(upgrade, "\n")
 	for _, fragment := range []string{
-		"migrating database from version 0 to 2",
+		"migrating database from version 0 to 3",
 		"added deliveries.read_at",
 		"healed deliveries.session_generation",
+		"dropped reconciler_state.herdr_session",
 	} {
 		if !strings.Contains(joined, fragment) {
 			t.Errorf("migration log missing %q:\n%s", fragment, joined)
@@ -353,24 +357,180 @@ func TestMigrationLogsOnlyUpgrade(t *testing.T) {
 	}
 }
 
-func TestCurrentTypeScriptSchemaOpensWithZeroSteps(t *testing.T) {
+func TestCurrentTypeScriptSchemaDropsOnlyTheDeadSessionColumn(t *testing.T) {
 	path := fixtureDatabase(t, "current-ts-schema.sql")
 	before := rawSchema(t, path)
-	var logs []string
-	store, err := Open(path, WithMigrationLogger(func(message string) { logs = append(logs, message) }))
+	store, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if len(logs) != 0 {
-		t.Fatalf("TS current schema ran migration steps: %v", logs)
-	}
 	if got := rawUserVersion(t, path); got != SchemaVersion {
-		t.Fatalf("user_version = %d", got)
+		t.Fatalf("user_version = %d, want %d", got, SchemaVersion)
 	}
-	if after := rawSchema(t, path); !reflect.DeepEqual(before, after) {
-		t.Fatalf("opening TS schema changed sqlite_master\nbefore=%v\nafter=%v", before, after)
+	columns := rawColumns(t, path, "reconciler_state")
+	if containsString(columns, "herdr_session") {
+		t.Fatalf("reconciler_state still has herdr_session: %v", columns)
+	}
+	wantColumns := []string{
+		"org_id", "workspace_id", "pane_id", "pane_label", "agent_kind",
+		"native_session_source", "native_session_kind", "native_session_value", "session_generation", "updated_at",
+	}
+	if !reflect.DeepEqual(columns, wantColumns) {
+		t.Fatalf("reconciler_state columns = %v, want %v", columns, wantColumns)
+	}
+	withoutReconcilerState := func(schema []string) []string {
+		filtered := make([]string, 0, len(schema))
+		for _, entry := range schema {
+			if strings.HasPrefix(entry, "table|reconciler_state|reconciler_state|") {
+				continue
+			}
+			filtered = append(filtered, entry)
+		}
+		return filtered
+	}
+	if after := rawSchema(t, path); !reflect.DeepEqual(withoutReconcilerState(before), withoutReconcilerState(after)) {
+		t.Fatalf("migration changed sqlite_master outside reconciler_state\nbefore=%v\nafter=%v", before, after)
+	}
+}
+
+func TestDroppedColumnKeepsReconcilerStateRowIntact(t *testing.T) {
+	path := fixtureDatabase(t, "current-ts-schema.sql")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+INSERT INTO reconciler_state (
+	org_id, herdr_session, workspace_id, pane_id, pane_label, agent_kind,
+	native_session_source, native_session_kind, native_session_value,
+	session_generation, updated_at
+) VALUES ('org', 'stale-session', 'wB', 'wB:p1', 'stub', 'omp', 'source', 'kind', 'value', 7, 99)`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	state, err := store.GetReconcilerState("org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.OrgID != "org" || state.WorkspaceID == nil || *state.WorkspaceID != "wB" ||
+		state.PaneID == nil || *state.PaneID != "wB:p1" || state.PaneLabel != "stub" || state.AgentKind != "omp" ||
+		state.NativeSessionSource == nil || *state.NativeSessionSource != "source" ||
+		state.NativeSessionKind == nil || *state.NativeSessionKind != "kind" ||
+		state.NativeSessionValue == nil || *state.NativeSessionValue != "value" ||
+		state.SessionGeneration != 7 || state.UpdatedAt != 99 {
+		t.Fatalf("GetReconcilerState = %#v, want preserved row", state)
+	}
+}
+
+func TestLeftoverHerdrSessionColumnCannotShiftReconcilerState(t *testing.T) {
+	path := fixtureDatabase(t, "current-ts-schema.sql")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+INSERT INTO reconciler_state (
+	org_id, herdr_session, workspace_id, pane_id, pane_label, agent_kind,
+	native_session_source, native_session_kind, native_session_value,
+	session_generation, updated_at
+) VALUES ('org', 'stale-session', 'wB', 'wB:p1', 'stub', 'omp', 'source', 'kind', 'value', 7, 99)`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	state, err := store.GetReconcilerState("org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || state.OrgID != "org" || state.WorkspaceID == nil || *state.WorkspaceID != "wB" ||
+		state.PaneID == nil || *state.PaneID != "wB:p1" || state.PaneLabel != "stub" || state.AgentKind != "omp" ||
+		state.NativeSessionSource == nil || *state.NativeSessionSource != "source" ||
+		state.NativeSessionKind == nil || *state.NativeSessionKind != "kind" ||
+		state.NativeSessionValue == nil || *state.NativeSessionValue != "value" ||
+		state.SessionGeneration != 7 || state.UpdatedAt != 99 {
+		t.Fatalf("GetReconcilerState = %#v, want preserved row", state)
+	}
+}
+
+// A pod that crash-loops re-opens the same file, and a hand-forced stamp is the
+// one thing an operator reaches for during a rollback. Step 3 must be a no-op
+// both times: the stamp is written in the same transaction as the DROP, so the
+// file is never half-migrated, and the step is guarded on the column still
+// being there, so re-running it against an already-dropped table is silent.
+func TestSchemaStepThreeIsIdempotentAcrossACrashLoop(t *testing.T) {
+	path := fixtureDatabase(t, "current-ts-schema.sql")
+	var logs []string
+	logger := WithMigrationLogger(func(msg string) { logs = append(logs, msg) })
+
+	store, err := Open(path, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	if !containsString(logs, "schema: dropped reconciler_state.herdr_session (never written, never compared)") {
+		t.Fatalf("first open did not drop the column: %v", logs)
+	}
+
+	// Reopen as a crash-loop would, then reopen again with the stamp forced back
+	// to the pre-migration version, which re-runs step 3 against a table that no
+	// longer has the column.
+	for _, forceVersion := range []int{0, SchemaVersion - 1} {
+		if forceVersion > 0 {
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(fmt.Sprintf("PRAGMA user_version = %d", forceVersion)); err != nil {
+				raw.Close()
+				t.Fatal(err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		logs = nil
+		store, err := Open(path, logger)
+		if err != nil {
+			t.Fatalf("reopen with user_version forced to %d failed: %v", forceVersion, err)
+		}
+		state, err := store.GetReconcilerState("missing")
+		if err != nil {
+			t.Fatalf("read after reopen failed: %v", err)
+		}
+		if state != nil {
+			t.Fatalf("GetReconcilerState(missing) = %#v, want nil", state)
+		}
+		store.Close()
+		if containsString(logs, "schema: dropped reconciler_state.herdr_session (never written, never compared)") {
+			t.Errorf("step 3 dropped the column twice (forced version %d): %v", forceVersion, logs)
+		}
+		if columns := rawColumns(t, path, "reconciler_state"); containsString(columns, "herdr_session") {
+			t.Errorf("herdr_session came back after reopen: %v", columns)
+		}
+		if version := rawUserVersion(t, path); version != SchemaVersion {
+			t.Errorf("user_version = %d after reopen, want %d", version, SchemaVersion)
+		}
 	}
 }

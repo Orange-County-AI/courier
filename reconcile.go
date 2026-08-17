@@ -38,7 +38,6 @@ type RelabelSignal string
 const (
 	RelabelSession       RelabelSignal = "session"
 	RelabelSessionPrefix RelabelSignal = "session-prefix"
-	RelabelPane          RelabelSignal = "pane"
 )
 
 type RelabelMatch struct {
@@ -54,11 +53,27 @@ type RelabelAmbiguity struct {
 type RelabelSearch struct {
 	Match     *RelabelMatch
 	Ambiguous *RelabelAmbiguity
+	// Occupant is an eligible agent sitting at the pane id this org recorded,
+	// reported only when no session evidence identified it. It is never adopted:
+	// it exists so the refusal is logged instead of silent.
+	Occupant *Agent
 }
 
 // FindRelabelCandidate identifies a restored agent whose routing label was
 // lost. The tiers are evidence strength, not scoring: the first non-empty tier
 // decides, and ambiguity refuses rather than adopting the wrong conversation.
+//
+// Every tier compares the agent's OWN session reference, and there is no pane
+// tier. Measured against herdr 0.8.0 (protocol 19) on 2026-08-17: public pane
+// numbering is persisted in ~/.config/herdr/session.json and restored, so wB:p1
+// outlives a restart; when that file is lost the counters restart and the same
+// wB:p1 is minted for an unrelated agent. herdr's protocol carries no
+// server-instance identity to scope the id with (ping answers type, version,
+// protocol and capabilities; session.snapshot adds only focus handles), and
+// terminal_id is no substitute — clock plus a process-local counter, minted
+// fresh on restore, and one terminal can be re-tenanted by another agent
+// session. So an agent at the recorded pane is evidence of location, never of
+// identity, and courier reports it as an Occupant rather than adopting it.
 func FindRelabelCandidate(agents []Agent, state *ReconcilerState) RelabelSearch {
 	if state == nil {
 		return RelabelSearch{}
@@ -97,16 +112,6 @@ func FindRelabelCandidate(agents []Agent, state *ReconcilerState) RelabelSearch 
 				return strings.HasPrefix(value, wantSession) || strings.HasPrefix(wantSession, value)
 			},
 		},
-		{
-			signal: RelabelPane,
-			match: func(agent Agent) bool {
-				if wantPane == "" || agent.PaneID != wantPane {
-					return false
-				}
-				value := reconcileSessionValue(agent)
-				return value == "" || wantSession == "" || value == wantSession
-			},
-		},
 	}
 
 	for _, tier := range tiers {
@@ -123,6 +128,14 @@ func FindRelabelCandidate(agents []Agent, state *ReconcilerState) RelabelSearch 
 			continue
 		default:
 			return RelabelSearch{Ambiguous: &RelabelAmbiguity{Signal: tier.signal, Agents: hits}}
+		}
+	}
+	if wantPane != "" {
+		for _, agent := range eligible {
+			if agent.PaneID == wantPane {
+				occupant := agent
+				return RelabelSearch{Occupant: &occupant}
+			}
 		}
 	}
 	return RelabelSearch{}
@@ -182,6 +195,10 @@ func Reconcile(ctx context.Context, opts ReconcileOptions) (ReconcileResult, err
 	if mismatched {
 		log(fmt.Sprintf("reconcile: %s is running %s, expected %s — restarting it", state.PaneLabel, existing.Agent, state.AgentKind))
 	}
+	// The one surviving use of a stored pane id, and it is an address to launch
+	// into rather than proof of identity: what starts here is courier's own agent
+	// under its own label. If the id has been re-minted for someone else, herdr
+	// answers agent_pane_busy or agent_pane_not_found and this reports unavailable.
 	if state.PaneID == nil || *state.PaneID == "" {
 		return reconcileUnavailable(state, fmt.Sprintf("agent %s is absent and reconciler_state has no pane_id to start it in", state.PaneLabel)), nil
 	}
@@ -230,8 +247,12 @@ func reconcileReacquire(
 ) (ReconcileResult, bool, error) {
 	agents, err := opts.Driver.ListAgents(ctx)
 	if err != nil {
-		// Listing is an optional recovery probe. The existing start path remains
-		// safe because herdr itself refuses an occupied pane.
+		// Listing is an optional recovery probe. The start path below is bounded,
+		// not safe: herdr answers agent_pane_busy only when the target pane
+		// already hosts an agent or is not its own idle foreground shell, and
+		// agent_pane_not_found when the id no longer resolves. An idle shell in
+		// any workspace is accepted, so the worst case is courier's own agent
+		// started in the wrong pane — never a stranger answering this org's chat.
 		log(fmt.Sprintf("reconcile: could not list agents to re-acquire %s — %v", state.PaneLabel, err))
 		return ReconcileResult{}, false, nil
 	}
@@ -254,6 +275,14 @@ func reconcileReacquire(
 		return reconcileUnavailable(state, message), true, nil
 	}
 	if search.Match == nil {
+		if search.Occupant != nil {
+			handle := search.Occupant.Name
+			if handle == "" {
+				handle = "<unnamed>"
+			}
+			log(fmt.Sprintf("reconcile: %s occupies %s but nothing identifies it as the agent for %s — a pane id is an address, not an identity, so it is NOT adopted",
+				handle, reconcilePointerValue(state.PaneID), state.PaneLabel))
+		}
 		return ReconcileResult{}, false, nil
 	}
 
@@ -298,7 +327,6 @@ func reconcileReacquire(
 func reconcilePutStateFromAgent(store *Store, state *ReconcilerState, agent *Agent, generation int64, now int64, refreshKind bool) (*ReconcilerState, error) {
 	input := ReconcilerStateInput{
 		OrgID:               state.OrgID,
-		HerdrSession:        state.HerdrSession,
 		WorkspaceID:         state.WorkspaceID,
 		PaneID:              state.PaneID,
 		PaneLabel:           state.PaneLabel,

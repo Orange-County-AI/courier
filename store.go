@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	SchemaVersion                = 2
+	SchemaVersion                = 3
 	DefaultRedeliverGraceMS      = int64(300_000)
 	DefaultRedeliverMaxBackoffMS = int64(1_800_000)
 	DefaultRedeliverReadFactor   = int64(4)
@@ -91,7 +91,6 @@ type Deliverable struct {
 
 type ReconcilerState struct {
 	OrgID               string
-	HerdrSession        *string
 	WorkspaceID         *string
 	PaneID              *string
 	PaneLabel           string
@@ -105,7 +104,6 @@ type ReconcilerState struct {
 
 type ReconcilerStateInput struct {
 	OrgID               string
-	HerdrSession        *string
 	WorkspaceID         *string
 	PaneID              *string
 	PaneLabel           string
@@ -327,6 +325,24 @@ func (s *Store) step(tx *sql.Tx, version int) error {
 			return fmt.Errorf("create mattermost_threads: %w", err)
 		}
 		return nil
+	case 3:
+		// herdr_session arrived with the TypeScript schema and was never written and
+		// never compared — the only mention was a struct round-trip. It read like it
+		// scoped pane_id to one herdr session; herdr exposes no server-instance
+		// identity to scope it with, so it never could, and the pane-only relabel
+		// tier that pretended otherwise is gone. A dead column that reads like a
+		// guard is worse than no column.
+		cols, err := columns(tx, "reconciler_state")
+		if err != nil {
+			return fmt.Errorf("inspect reconciler_state columns: %w", err)
+		}
+		if cols["herdr_session"] {
+			if _, err := tx.Exec("ALTER TABLE reconciler_state DROP COLUMN herdr_session"); err != nil {
+				return fmt.Errorf("drop reconciler_state.herdr_session: %w", err)
+			}
+			s.log("schema: dropped reconciler_state.herdr_session (never written, never compared)")
+		}
+		return nil
 	default:
 		return fmt.Errorf("no migration step defined for schema version %d", version)
 	}
@@ -379,7 +395,6 @@ var baselineStatements = []string{
       )`,
 	`CREATE TABLE IF NOT EXISTS reconciler_state (
         org_id TEXT PRIMARY KEY,
-        herdr_session TEXT,
         workspace_id TEXT,
         pane_id TEXT,
         pane_label TEXT NOT NULL,
@@ -1146,13 +1161,12 @@ func (s *Store) Backfill(target string, now int64) ([]Delivery, error) {
 
 func scanReconcilerState(row rowScanner) (*ReconcilerState, error) {
 	var state ReconcilerState
-	var herdrSession, workspaceID, paneID sql.NullString
+	var workspaceID, paneID sql.NullString
 	var nativeSource, nativeKind, nativeValue sql.NullString
-	if err := row.Scan(&state.OrgID, &herdrSession, &workspaceID, &paneID, &state.PaneLabel,
+	if err := row.Scan(&state.OrgID, &workspaceID, &paneID, &state.PaneLabel,
 		&state.AgentKind, &nativeSource, &nativeKind, &nativeValue, &state.SessionGeneration, &state.UpdatedAt); err != nil {
 		return nil, err
 	}
-	state.HerdrSession = nullableString(herdrSession)
 	state.WorkspaceID = nullableString(workspaceID)
 	state.PaneID = nullableString(paneID)
 	state.NativeSessionSource = nullableString(nativeSource)
@@ -1161,8 +1175,16 @@ func scanReconcilerState(row rowScanner) (*ReconcilerState, error) {
 	return &state, nil
 }
 
+// Named columns, not SELECT *: scanReconcilerState reads positionally, so a file
+// that still carries the dropped herdr_session column — migration skipped, or a
+// row provisioned by hand against an old schema — would shift every field by one
+// and answer with a pane id in the workspace slot instead of failing. Naming the
+// columns makes a leftover column inert.
+const reconcilerStateColumns = `org_id, workspace_id, pane_id, pane_label, agent_kind,
+        native_session_source, native_session_kind, native_session_value, session_generation, updated_at`
+
 func (s *Store) GetReconcilerState(orgID string) (*ReconcilerState, error) {
-	state, err := scanReconcilerState(s.db.QueryRow("SELECT * FROM reconciler_state WHERE org_id = ?", orgID))
+	state, err := scanReconcilerState(s.db.QueryRow("SELECT "+reconcilerStateColumns+" FROM reconciler_state WHERE org_id = ?", orgID))
 	return noRows(state, err)
 }
 
@@ -1177,12 +1199,11 @@ func (s *Store) PutReconcilerState(input ReconcilerStateInput, now int64) (*Reco
 		generation = *input.SessionGeneration
 	}
 	_, err := s.db.Exec(`
-        INSERT INTO reconciler_state (org_id, herdr_session, workspace_id, pane_id, pane_label,
+        INSERT INTO reconciler_state (org_id, workspace_id, pane_id, pane_label,
                                       agent_kind, native_session_source, native_session_kind,
                                       native_session_value, session_generation, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(org_id) DO UPDATE SET
-          herdr_session = excluded.herdr_session,
           workspace_id = excluded.workspace_id,
           pane_id = excluded.pane_id,
           pane_label = excluded.pane_label,
@@ -1192,7 +1213,7 @@ func (s *Store) PutReconcilerState(input ReconcilerStateInput, now int64) (*Reco
           native_session_value = excluded.native_session_value,
           session_generation = excluded.session_generation,
           updated_at = excluded.updated_at
-      `, input.OrgID, input.HerdrSession, input.WorkspaceID, input.PaneID, input.PaneLabel, input.AgentKind,
+      `, input.OrgID, input.WorkspaceID, input.PaneID, input.PaneLabel, input.AgentKind,
 		input.NativeSessionSource, input.NativeSessionKind, input.NativeSessionValue, generation, now)
 	if err != nil {
 		return nil, err

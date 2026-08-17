@@ -65,8 +65,10 @@ and enforced on every call:
  daemon startup ─▶ Reconcile: resolve the label in herdr
                      ├─ present ────────────▶ refresh state
                      ├─ label lost (restart)▶ relabel the restored agent by
-                     │                         session ▸ session-prefix ▸ pane
-                     │                         (ambiguous matches refuse)
+                     │                         session ▸ session-prefix
+                     │                         (ambiguous matches refuse; a bare
+                     │                          pane id is an address, not an
+                     │                          identity, and never adopts)
                      └─ absent ─────────────▶ start it in the recorded pane,
                                               resume preferred over fresh
 

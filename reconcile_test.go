@@ -140,7 +140,7 @@ func TestReconcileListFailureFallsThroughToSafeStart(t *testing.T) {
 	}
 }
 
-func TestFindRelabelCandidateUsesIdentityTiers(t *testing.T) {
+func TestFindRelabelCandidateUsesSessionEvidenceOnly(t *testing.T) {
 	workspace := "w1"
 	pane := "w1:p1"
 	source := "herdr:omp"
@@ -152,49 +152,85 @@ func TestFindRelabelCandidateUsesIdentityTiers(t *testing.T) {
 		SessionGeneration: 3,
 	}
 
-	t.Run("exact session beats pane", func(t *testing.T) {
-		found := FindRelabelCandidate([]Agent{{
-			Agent: "omp", PaneID: "wB:p7", Session: &AgentSession{Value: session},
-		}}, state)
-		if found.Match == nil || found.Match.Signal != RelabelSession {
-			t.Fatalf("found = %#v", found)
-		}
-	})
+	tests := []struct {
+		name         string
+		agents       []Agent
+		wantSignal   RelabelSignal
+		wantMatch    bool
+		wantOccupant bool
+	}{
+		{
+			name:       "exact session beats pane",
+			agents:     []Agent{{Agent: "omp", PaneID: "wB:p7", Session: &AgentSession{Value: session}}},
+			wantSignal: RelabelSession,
+			wantMatch:  true,
+		},
+		{
+			name:       "session prefix is value prefix not dirname",
+			agents:     []Agent{{Agent: "omp", PaneID: "other", Session: &AgentSession{Value: session + ".continued"}}},
+			wantSignal: RelabelSessionPrefix,
+			wantMatch:  true,
+		},
+		{
+			name:   "same directory is not identity",
+			agents: []Agent{{Agent: "omp", PaneID: "wB:p7", Session: &AgentSession{Value: "/home/dev/.omp/agent/sessions/-projects-acme-widget/B.jsonl"}}},
+		},
+		{
+			name:   "correctly named agent is not a candidate",
+			agents: []Agent{{Name: "helper", Agent: "omp", PaneID: pane, Session: &AgentSession{Value: session}}},
+		},
+		{
+			name:         "bare pane is not identity",
+			agents:       []Agent{{Agent: "omp", PaneID: pane}},
+			wantOccupant: true,
+		},
+		{
+			name:         "sessionless omp at the recorded pane is not adopted",
+			agents:       []Agent{{Agent: "omp", PaneID: pane, Session: &AgentSession{}}},
+			wantOccupant: true,
+		},
+		{
+			name:         "stranger session at the recorded pane is not adopted",
+			agents:       []Agent{{Agent: "omp", PaneID: pane, Session: &AgentSession{Value: "/home/dev/.omp/agent/sessions/-projects-acme-widget/B.jsonl"}}},
+			wantOccupant: true,
+		},
+		{
+			name:   "elsewhere without session evidence is not an occupant",
+			agents: []Agent{{Agent: "omp", PaneID: "wB:p7"}},
+		},
+	}
 
-	t.Run("same directory is not identity", func(t *testing.T) {
-		sibling := "/home/dev/.omp/agent/sessions/-projects-acme-widget/B.jsonl"
-		found := FindRelabelCandidate([]Agent{{
-			Agent: "omp", PaneID: "wB:p7", Session: &AgentSession{Value: sibling},
-		}}, state)
-		if found.Match != nil || found.Ambiguous != nil {
-			t.Fatalf("found = %#v", found)
-		}
-	})
-
-	t.Run("bare pane is weakest accepted signal", func(t *testing.T) {
-		found := FindRelabelCandidate([]Agent{{Agent: "omp", PaneID: pane}}, state)
-		if found.Match == nil || found.Match.Signal != RelabelPane {
-			t.Fatalf("found = %#v", found)
-		}
-	})
-
-	t.Run("correctly named agent is not a candidate", func(t *testing.T) {
-		found := FindRelabelCandidate([]Agent{{
-			Name: "helper", Agent: "omp", PaneID: pane, Session: &AgentSession{Value: session},
-		}}, state)
-		if found.Match != nil {
-			t.Fatalf("found = %#v", found)
-		}
-	})
-
-	t.Run("session prefix is value prefix not dirname", func(t *testing.T) {
-		found := FindRelabelCandidate([]Agent{{
-			Agent: "omp", PaneID: "other", Session: &AgentSession{Value: session + ".continued"},
-		}}, state)
-		if found.Match == nil || found.Match.Signal != RelabelSessionPrefix {
-			t.Fatalf("found = %#v", found)
-		}
-	})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			found := FindRelabelCandidate(test.agents, state)
+			if found.Ambiguous != nil {
+				t.Fatalf("FindRelabelCandidate = %#v, want no ambiguity", found)
+			}
+			if test.wantMatch {
+				if found.Match == nil {
+					t.Fatalf("FindRelabelCandidate = %#v, want match", found)
+				}
+				if found.Match.Signal != test.wantSignal {
+					t.Errorf("signal = %q, want %q", found.Match.Signal, test.wantSignal)
+				}
+				if !reflect.DeepEqual(found.Match.Agent, test.agents[0]) {
+					t.Errorf("matched agent = %#v, want %#v", found.Match.Agent, test.agents[0])
+				}
+			} else if found.Match != nil {
+				t.Errorf("FindRelabelCandidate = %#v, want no match", found)
+			}
+			if test.wantOccupant {
+				if found.Occupant == nil {
+					t.Fatalf("FindRelabelCandidate = %#v, want occupant", found)
+				}
+				if found.Occupant.PaneID != pane {
+					t.Errorf("occupant pane = %q, want %q", found.Occupant.PaneID, pane)
+				}
+			} else if found.Occupant != nil {
+				t.Errorf("occupant = %#v, want nil", found.Occupant)
+			}
+		})
+	}
 }
 
 func TestReconcileRefreshesNativeSessionOnEveryLook(t *testing.T) {
@@ -228,6 +264,29 @@ func TestReconcileResumeFailureFallsBackFreshAndLogs(t *testing.T) {
 		t.Fatalf("starts = %#v", starts)
 	}
 	if len(logs) == 0 || !strings.Contains(strings.Join(logs, "\n"), "starting fresh") {
+		t.Fatalf("logs = %v", logs)
+	}
+}
+
+func TestReconcileDoesNotAdoptSessionlessAgentAtRecordedPane(t *testing.T) {
+	h := dispatchNewHarness(t)
+	h.Driver.Agents = []Agent{{Agent: "claude", Status: "idle", PaneID: "w1:p1", WorkspaceID: "w1"}}
+	var logs []string
+
+	result, err := Reconcile(context.Background(), ReconcileOptions{
+		Store: h.Store, Driver: h.Driver, OrgID: h.OrgID, Now: h.Clock.Now,
+		Log: func(message string) { logs = append(logs, message) },
+	})
+	if err != nil || result.Action != ReconcileRestartedResume {
+		t.Fatalf("Reconcile = %#v, %v", result, err)
+	}
+	if renames := h.Driver.RenameLog(); len(renames) != 0 {
+		t.Fatalf("renames = %#v, want none", renames)
+	}
+	if starts := h.Driver.StartLog(); len(starts) != 1 {
+		t.Fatalf("starts = %#v, want one", starts)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "is an address, not an identity") {
 		t.Fatalf("logs = %v", logs)
 	}
 }
