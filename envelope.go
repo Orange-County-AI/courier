@@ -156,44 +156,41 @@ func BuildEnvelope(in EnvelopeInput) string {
 	}
 	tag.WriteString(` schema="`)
 	tag.WriteString(attr(EnvelopeSchema))
-	if in.PreviewOn {
+	if in.PreviewOn || redelivery > 0 {
 		tag.WriteString(`">`)
 	} else {
 		tag.WriteString(`"/>`)
 	}
 
 	var envelope strings.Builder
-	envelope.Grow(tag.Len() + PreviewChars + 3)
+	envelope.Grow(tag.Len() + PreviewChars + 100)
 	envelope.WriteString(tag.String())
 	if in.PreviewOn {
 		envelope.WriteByte('\n')
 		envelope.WriteString(preview(in.Content))
-		envelope.WriteString("\n</msg>")
 	}
-
 	if redelivery > 0 {
-		envelope.WriteString("\n\n")
+		envelope.WriteByte('\n')
 		if !in.Read {
-			envelope.WriteString("[This message has been delivered to you ")
+			envelope.WriteString("[redelivery ")
 			envelope.WriteString(strconv.Itoa(redelivery))
-			envelope.WriteString(" time(s) before and was never confirmed — no chat_reply and no mark_handled. If you already answered it, do NOT answer again: call mark_handled with delivery_id=\"")
-			envelope.WriteString(in.DeliveryID)
-			envelope.WriteString("\". Otherwise handle it now.]")
+			envelope.WriteString(", unread: already replied? mark_handled; otherwise read_message]")
 		} else {
-			envelope.WriteString("[You already READ this message and never settled it — no chat_reply and no mark_handled (delivered ")
+			envelope.WriteString("[redelivery ")
 			envelope.WriteString(strconv.Itoa(redelivery))
-			envelope.WriteString(" time(s) before). Settle it now: chat_reply if a reply serves the sender, mark_handled with delivery_id=\"")
-			envelope.WriteString(in.DeliveryID)
-			envelope.WriteString("\" if none is warranted.]")
+			envelope.WriteString(", read/unsettled: do not reply twice; chat_reply or mark_handled]")
 		}
+	}
+	if in.PreviewOn || redelivery > 0 {
+		envelope.WriteString("\n</msg>")
 	}
 
 	return envelope.String()
 }
 
 const (
-	msgFullJudgment = "Now your judgment: chat_reply (delivery_id and conversation_id unchanged) if a reply serves the sender, or mark_handled if none is warranted. Both settle it; doing neither brings it back."
-	msgFullSettled  = "[This message is already settled — you replied to it or marked it handled. You are reading it as history; it will not be delivered again, and it needs nothing further unless the sender asked.]"
+	msgFullJudgment = "[settle: chat_reply or mark_handled]"
+	msgFullSettled  = "[already settled; history only]"
 )
 
 // BuildMsgFull formats read_message's successor response. The event content is
@@ -226,11 +223,12 @@ func BuildMsgFull(in MsgFullInput) string {
 	out.WriteString(attr(EnvelopeSchema))
 	out.WriteString("\">\n")
 	out.WriteString(in.Content)
-	out.WriteString("\n</msg_full>\n\n")
+	out.WriteByte('\n')
 	if in.Settled {
 		out.WriteString(msgFullSettled)
 	} else {
 		out.WriteString(msgFullJudgment)
 	}
+	out.WriteString("\n</msg_full>")
 	return out.String()
 }

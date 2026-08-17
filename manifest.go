@@ -4,9 +4,9 @@ import "fmt"
 
 const ManifestProtocol = 2
 
-// BaseInstructions is the standing half of the pointer contract. courier/1 has
-// no per-envelope trailer or <todo>, so read-then-judge must be explicit here
-// and remain available mid-turn through the absolute schema skill path.
+// BaseInstructions is the standing half of the pointer contract. courier/1 keeps
+// its exceptional guidance terse and inside the element, so read-then-judge must
+// remain available mid-turn through the absolute schema skill path.
 const BaseInstructions = "You are connected to a chat application through courier. Incoming messages arrive in your " +
 	"session as <msg> blocks, and each one is a POINTER, not the message: it carries the ids as " +
 	"attributes, and usually a one-line preview. The full text lives in courier, so ALWAYS call read_message " +

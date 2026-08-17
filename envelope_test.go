@@ -40,7 +40,7 @@ func TestBuildEnvelopeExactShapeAndAttributeOrder(t *testing.T) {
 		t.Fatalf("BuildEnvelope mismatch\nwant: %q\n got: %q", want, got)
 	}
 	if strings.Contains(got, "preview — full message") {
-		t.Fatalf("courier/1 must not emit a trailer: %q", got)
+		t.Fatalf("courier/1 must not emit a normal-delivery note: %q", got)
 	}
 }
 
@@ -126,26 +126,26 @@ func TestBuildEnvelopePreviewOffIsSelfClosing(t *testing.T) {
 	}
 }
 
-func TestBuildEnvelopeRedeliveryBannersAreExactAndAfterTag(t *testing.T) {
+func TestBuildEnvelopeRedeliveryNotesAreExactAndInsideTag(t *testing.T) {
 	in := baseEnvelopeInput()
 	in.AttemptCount = 2
 	in.PreviewOn = false
-	base := `<msg delivery_id="delivery-1" conversation_id="conversation-1" user="Dana" connector="mattermost" redelivery="1" trigger="dm" schema="courier/1"/>`
-	unreadBanner := `[This message has been delivered to you 1 time(s) before and was never confirmed — no chat_reply and no mark_handled. If you already answered it, do NOT answer again: call mark_handled with delivery_id="delivery-1". Otherwise handle it now.]`
-	if got, want := BuildEnvelope(in), base+"\n\n"+unreadBanner; got != want {
+	open := `<msg delivery_id="delivery-1" conversation_id="conversation-1" user="Dana" connector="mattermost" redelivery="1" trigger="dm" schema="courier/1">`
+	unreadNote := `[redelivery 1, unread: already replied? mark_handled; otherwise read_message]`
+	if got, want := BuildEnvelope(in), open+"\n"+unreadNote+"\n</msg>"; got != want {
 		t.Fatalf("unread redelivery mismatch\nwant: %q\n got: %q", want, got)
 	}
 
 	in.Read = true
-	readBanner := `[You already READ this message and never settled it — no chat_reply and no mark_handled (delivered 1 time(s) before). Settle it now: chat_reply if a reply serves the sender, mark_handled with delivery_id="delivery-1" if none is warranted.]`
-	if got, want := BuildEnvelope(in), base+"\n\n"+readBanner; got != want {
+	readNote := `[redelivery 1, read/unsettled: do not reply twice; chat_reply or mark_handled]`
+	if got, want := BuildEnvelope(in), open+"\n"+readNote+"\n</msg>"; got != want {
 		t.Fatalf("read redelivery mismatch\nwant: %q\n got: %q", want, got)
 	}
 
 	in.PreviewOn = true
 	got := BuildEnvelope(in)
-	if !strings.Contains(got, "\n</msg>\n\n"+readBanner) {
-		t.Fatalf("preview-on banner not after closing tag and blank line: %q", got)
+	if !strings.HasSuffix(got, "\n"+readNote+"\n</msg>") {
+		t.Fatalf("preview-on note not inside closing tag: %q", got)
 	}
 }
 
@@ -202,7 +202,7 @@ func TestBuildMsgFullVerbatimAndJudgment(t *testing.T) {
 		FirstRead:      true,
 	}
 	want := `<msg_full delivery_id="d&amp;&quot;" conversation_id="c&lt;1&gt;" user="Dana &quot;D&quot;" connector="mattermost" status="dispatched" read="first" schema="courier/1">` + "\n" +
-		in.Content + "\n</msg_full>\n\n" + msgFullJudgment
+		in.Content + "\n" + msgFullJudgment + "\n</msg_full>"
 	if got := BuildMsgFull(in); got != want {
 		t.Fatalf("BuildMsgFull mismatch\nwant: %q\n got: %q", want, got)
 	}
@@ -219,7 +219,7 @@ func TestBuildMsgFullSettledAgain(t *testing.T) {
 	}
 	got := BuildMsgFull(in)
 	want := `<msg_full delivery_id="d1" conversation_id="c1" user="unknown" connector="gmail" status="handled" read="again" schema="courier/1">` +
-		"\nbody\n</msg_full>\n\n" + msgFullSettled
+		"\nbody\n" + msgFullSettled + "\n</msg_full>"
 	if got != want {
 		t.Fatalf("settled BuildMsgFull\nwant: %q\n got: %q", want, got)
 	}

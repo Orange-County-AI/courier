@@ -190,8 +190,8 @@ func TestReadMessageReturnsVerbatimContentIDsAndJudgment(t *testing.T) {
 			t.Errorf("read result missing %q: %q", fragment, result.Text)
 		}
 	}
-	if result.IsError || !strings.HasSuffix(result.Text, msgFullJudgment) {
-		t.Fatalf("read result does not end in judgment: %#v", result)
+	if result.IsError || !strings.HasSuffix(result.Text, msgFullJudgment+"\n</msg_full>") {
+		t.Fatalf("read result does not end with the in-element judgment: %#v", result)
 	}
 }
 

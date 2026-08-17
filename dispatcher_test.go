@@ -41,9 +41,9 @@ func TestDispatchSuccessStaysUnsettledAndRedelivers(t *testing.T) {
 		t.Fatalf("prompts = %d, want 2", len(prompts))
 	}
 	if !strings.Contains(prompts[0].Text, `redelivery="0"`) || !strings.Contains(prompts[1].Text, `redelivery="1"`) ||
-		!strings.Contains(prompts[1].Text, "delivered to you 1 time(s) before") ||
-		!strings.Contains(prompts[1].Text, `mark_handled with delivery_id="`+row.DeliveryID+`"`) {
-		t.Fatalf("redelivery envelope missing contract: %q", prompts[1].Text)
+		!strings.Contains(prompts[1].Text, "[redelivery 1, unread:") ||
+		!strings.HasSuffix(prompts[1].Text, "\n</msg>") {
+		t.Fatalf("redelivery note missing from envelope: %q", prompts[1].Text)
 	}
 	if delivery := getTestDelivery(t, h.Store, row.DeliveryID); delivery.AttemptCount != 2 {
 		t.Fatalf("attempt count = %d, want 2", delivery.AttemptCount)

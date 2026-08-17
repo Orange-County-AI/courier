@@ -114,8 +114,8 @@ There are two acknowledgements, and only the second one settles anything:
 
 Settlement writes `handled_at` through exactly one store path, shared by the confirmed
 post and `mark_handled`. Until then the delivery is redelivered forever with growing
-backoff — and an explicit banner telling the agent whether it previously read but never
-settled the message. A failed outbound post is retried by courier, not the agent: a
+backoff — and a terse note inside `<msg>` telling the agent whether it previously read
+but never settled the message. A failed outbound post is retried by courier, not the agent: a
 repeat `chat_reply` is recognized as a duplicate and never double-posts.
 
 ### The draft guard
@@ -303,7 +303,7 @@ Can you check whether the Friday batch went out…
 </msg>
 ```
 
-The pointer is not the message. The agent must call `read_message` with the `delivery_id`, then settle exactly once: `chat_reply` (ids passed back unchanged) when a visible reply serves the sender, or `mark_handled` when none is warranted. Reading is a receipt, not settlement; doing neither causes redelivery with an explicit banner. The complete schema — attribute order, preview bounds, escaping rules, redelivery wording, and the tool workflow — is defined in [`SKILL.md`](./SKILL.md). Install that file wherever your agents read skills.
+The pointer is not the message. The agent must call `read_message` with the `delivery_id`, then settle exactly once: `chat_reply` (ids passed back unchanged) when a visible reply serves the sender, or `mark_handled` when none is warranted. Reading is a receipt, not settlement; doing neither causes redelivery with a terse note inside `<msg>`. Courier emits no guidance after a closing tag. The complete schema — attribute order, preview bounds, escaping rules, redelivery wording, and the tool workflow — is defined in [`SKILL.md`](./SKILL.md). Install that file wherever your agents read skills.
 
 ## Lifecycle
 
