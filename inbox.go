@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -87,7 +89,7 @@ func inboxTogglePause(ctx context.Context, opts clientOptions, inbox clientInbox
 }
 
 func inboxRender(out io.Writer, inbox clientInbox, status string) {
-	width := inboxWidth()
+	width := inboxWidth(out)
 	fmt.Fprint(out, inboxClearScreen)
 	fmt.Fprintln(out, inboxHeader(inbox))
 	fmt.Fprintln(out)
@@ -135,10 +137,16 @@ func inboxHeader(inbox clientInbox) string {
 	return header.String()
 }
 
-// inboxWidth trusts $COLUMNS when the pane exports it and otherwise assumes a
-// conventional width: this program never queries the terminal, so there is no
-// ioctl to disagree with.
-func inboxWidth() int {
+// inboxWidth asks the terminal how wide it is, because a herdr plugin pane does
+// not export $COLUMNS and a split pane is routinely narrower than any assumed
+// default — a wrong width here wraps every row and ruins the table. $COLUMNS
+// still wins for a non-tty writer (tests, pipes), and 100 is the last resort.
+func inboxWidth(out io.Writer) int {
+	if file, ok := out.(*os.File); ok {
+		if size, err := unix.IoctlGetWinsize(int(file.Fd()), unix.TIOCGWINSZ); err == nil && size.Col > 0 {
+			return int(size.Col)
+		}
+	}
 	if raw, ok := os.LookupEnv("COLUMNS"); ok {
 		if columns, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && columns > 0 {
 			return columns
