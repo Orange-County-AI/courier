@@ -291,6 +291,40 @@ func TestReconcileDoesNotAdoptSessionlessAgentAtRecordedPane(t *testing.T) {
 	}
 }
 
+// An occupant from ListAgents owns an agent terminal, so herdr start_agent refuses
+// that pane with agent_pane_busy (src/app/agents.rs:178-190) and courier reports
+// unavailable. Keep this pair pinned: renaming the herdr error must not silently
+// erase the operator fingerprint.
+func TestReconcileReportsUnavailableWhenOccupantBlocksStart(t *testing.T) {
+	h := dispatchNewHarness(t)
+	h.Driver.Agents = []Agent{{Agent: "claude", Status: "idle", PaneID: "w1:p1", WorkspaceID: "w1"}}
+	h.Driver.StartErr = errors.New("herdr agent start agent-a: agent_pane_busy")
+	var logs []string
+
+	result, err := Reconcile(context.Background(), ReconcileOptions{
+		Store: h.Store, Driver: h.Driver, OrgID: h.OrgID, Now: h.Clock.Now,
+		Log: func(message string) { logs = append(logs, message) },
+	})
+	if err != nil || result.Action != ReconcileUnavailable {
+		t.Fatalf("Reconcile = %#v, %v", result, err)
+	}
+	if !strings.Contains(result.Error, "agent_pane_busy") {
+		t.Fatalf("result error = %q", result.Error)
+	}
+	if renames := h.Driver.RenameLog(); len(renames) != 0 {
+		t.Fatalf("renames = %#v, want none", renames)
+	}
+	joinedLogs := strings.Join(logs, "\n")
+	const refusalLog = "is an address, not an identity"
+	if !strings.Contains(joinedLogs, refusalLog) {
+		t.Fatalf("logs = %v", logs)
+	}
+	const unavailableLog = "could not start"
+	if refusalIndex, unavailableIndex := strings.Index(joinedLogs, refusalLog), strings.Index(joinedLogs, unavailableLog); unavailableIndex == -1 || refusalIndex >= unavailableIndex {
+		t.Fatalf("logs = %v", logs)
+	}
+}
+
 func TestReconcileWithoutProvisionedStateRefuses(t *testing.T) {
 	store := openTestStore(t)
 	driver := &FakeDriver{}
