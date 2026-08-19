@@ -510,7 +510,7 @@ func TestTelegramProductionEnvironmentAndRegistration(t *testing.T) {
 		"CHANNEL_ORG": "demo", "CHANNEL_TARGET": "helper", "CHANNEL_CONNECTORS": "telegram",
 		"TELEGRAM_LISTEN_PORT": "7784", "TELEGRAM_BOT_TOKEN": telegramTestToken,
 		"TELEGRAM_WEBHOOK_SECRET": "webhook-secret", "TELEGRAM_BOT_USERNAME": "example_bot",
-		"TELEGRAM_GROUP_REQUIRE_MENTION": "1", "TELEGRAM_CLEAR_DISABLED": "1",
+		"TELEGRAM_GROUP_REQUIRE_MENTION": "1", "TELEGRAM_REQUIRE_VISIBLE_ACK": "1", "TELEGRAM_CLEAR_DISABLED": "1",
 		"TELEGRAM_CLEAR_ACK": "clear is disabled", "TELEGRAM_DISCONNECT_NOTICE": "helper is unavailable",
 		"TELEGRAM_ALLOWED_USER_IDS": "42", "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
 		"TELEGRAM_ATTACHMENT_DIR": "/var/lib/courier/telegram-attachments",
@@ -520,7 +520,7 @@ func TestTelegramProductionEnvironmentAndRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !opts.Telegram.Enabled || opts.Telegram.ListenPort != 7784 || opts.Telegram.BotToken != telegramTestToken || !opts.Telegram.GroupRequireMention || !opts.Telegram.ClearDisabled || opts.Telegram.AttachmentDir != "/var/lib/courier/telegram-attachments" || opts.Telegram.DisconnectNotice != "helper is unavailable" {
+	if !opts.Telegram.Enabled || opts.Telegram.ListenPort != 7784 || opts.Telegram.BotToken != telegramTestToken || !opts.Telegram.GroupRequireMention || !opts.Telegram.RequireVisibleAck || !opts.Telegram.ClearDisabled || opts.Telegram.AttachmentDir != "/var/lib/courier/telegram-attachments" || opts.Telegram.DisconnectNotice != "helper is unavailable" {
 		t.Fatalf("telegram options = %#v", opts.Telegram)
 	}
 	store, err := Open(filepath.Join(t.TempDir(), "courier.sqlite"))
@@ -534,5 +534,8 @@ func TestTelegramProductionEnvironmentAndRegistration(t *testing.T) {
 	}
 	if registry.Get(TelegramName) == nil || len(active) != 1 || active[0].Name() != TelegramName {
 		t.Fatalf("telegram registration: active=%#v connector=%#v", active, registry.Get(TelegramName))
+	}
+	if instructions := registry.Get(TelegramName).Instructions(); !strings.Contains(instructions, "visible acknowledgement") || !strings.Contains(instructions, "do not silently settle") {
+		t.Fatalf("telegram visible acknowledgement instructions = %q", instructions)
 	}
 }

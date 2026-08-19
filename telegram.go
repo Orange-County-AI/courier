@@ -60,6 +60,9 @@ const telegramInstructions = "Telegram messages arrive with connector=\"telegram
 	"Downloaded media is listed by local path in the message content. telegram_react and telegram_edit_message are only for " +
 	"reactions and edits; use chat_reply for the ordinary answer."
 
+const telegramVisibleAckInstructions = " This deployment requires a visible acknowledgement for every Telegram message. " +
+	"Use chat_reply for requests and a brief acknowledgement for FYI messages; do not silently settle Telegram with mark_handled."
+
 type TelegramConnectorConfig struct {
 	Store   *Store
 	Target  string
@@ -231,7 +234,12 @@ func (t *TelegramConnector) ManifestTools() []ToolDef {
 	return append([]ToolDef(nil), telegramTools...)
 }
 
-func (t *TelegramConnector) Instructions() string { return telegramInstructions }
+func (t *TelegramConnector) Instructions() string {
+	if t.opts.RequireVisibleAck {
+		return telegramInstructions + telegramVisibleAckInstructions
+	}
+	return telegramInstructions
+}
 
 func (t *TelegramConnector) CallTool(ctx context.Context, name string, args map[string]any) (ToolResult, error) {
 	if name != "telegram_react" && name != "telegram_edit_message" {

@@ -63,6 +63,7 @@ type TelegramOptions struct {
 	AllowedChatIDs      string
 	AttachmentDir       string
 	GroupRequireMention bool
+	RequireVisibleAck   bool
 	ClearDisabled       bool
 	ClearAck            string
 	DisconnectNotice    string
@@ -270,6 +271,8 @@ func serveOptionsFromEnv(lookup envLookup, warn func(string)) (ServeOptions, err
 		}
 		groupMention, _ := value("TELEGRAM_GROUP_REQUIRE_MENTION")
 		telegram.GroupRequireMention = parseShadow(groupMention)
+		requireVisibleAck, _ := value("TELEGRAM_REQUIRE_VISIBLE_ACK")
+		telegram.RequireVisibleAck = parseShadow(requireVisibleAck)
 		clearDisabled, _ := value("TELEGRAM_CLEAR_DISABLED")
 		telegram.ClearDisabled = parseShadow(clearDisabled)
 		telegram.ClearAck, _ = value("TELEGRAM_CLEAR_ACK")

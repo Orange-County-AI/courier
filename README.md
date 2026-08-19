@@ -256,11 +256,16 @@ export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_WEBHOOK_SECRET=...
 export TELEGRAM_ALLOWED_USER_IDS=42          # and/or TELEGRAM_ALLOWED_CHAT_IDS=-100xxxx
 # optional: TELEGRAM_BOT_USERNAME, TELEGRAM_BOT_USER_ID, TELEGRAM_GROUP_REQUIRE_MENTION,
-#           TELEGRAM_ATTACHMENT_DIR, TELEGRAM_CLEAR_DISABLED, TELEGRAM_CLEAR_ACK,
-#           TELEGRAM_DISCONNECT_NOTICE
+#           TELEGRAM_REQUIRE_VISIBLE_ACK, TELEGRAM_ATTACHMENT_DIR,
+#           TELEGRAM_CLEAR_DISABLED, TELEGRAM_CLEAR_ACK, TELEGRAM_DISCONNECT_NOTICE
 ```
 
 Telegram reaches the webhook on the loopback listener; put your own TLS-terminating proxy or tunnel in front of it. `TELEGRAM_WEBHOOK_SECRET` is validated against `X-Telegram-Bot-Api-Secret-Token` on every request.
+
+`TELEGRAM_REQUIRE_VISIBLE_ACK=1` makes the connector instructions require a
+`chat_reply` for every delivered Telegram message, including a brief
+acknowledgement for FYI messages. It prevents a healthy delivery from looking
+like an outage because the agent silently chose `mark_handled`.
 
 **Kaneo** (signed webhooks; activation requires the listen port plus all three credentials):
 
