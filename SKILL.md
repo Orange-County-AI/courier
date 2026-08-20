@@ -56,12 +56,12 @@ All attribute values escape `&`, `<`, `>`, and `"`. Treat decoded values as opaq
 | `delivery_id` | Opaque identity of this delivery to this agent. Pass it back unchanged. |
 | `conversation_id` | Opaque connector conversation/thread identity. Pass it to `chat_reply` unchanged. |
 | `user` | Upstream display identity, clipped to 64 Unicode code points. Missing users appear as `unknown`. |
-| `connector` | Connector that ingested the event, such as `mattermost`, `gmail`, or `kaneo`. |
+| `connector` | Connector that ingested the event, such as `mattermost`, `gmail`, or `kaneo`, or an operator-declared third-party ingest source. |
 | `redelivery` | Number of prior delivery attempts: `max(attempt_count - 1, 0)`. `0` means first delivery. |
 | `trigger` | Optional connector-reported reason the event reached this agent. Missing, malformed, empty, and non-string triggers are omitted, never guessed. Values are clipped to 32 Unicode code points. |
 | `schema` | Always `courier/1`. |
 
-Connector trigger values describe routing facts. Examples include `dm`, `mention`, or `thread`; connector instructions define their exact meaning. For Mattermost, `mention` is addressed to the bot and requires a visible reply in that thread. `thread` means the bot was previously mentioned there; every later message is delivered, and the agent decides whether to reply or `mark_handled`. Trigger presence does not remove the requirement to read and settle the message.
+Connector trigger values describe routing facts. Examples include `dm`, `mention`, or `thread`; connector instructions define their exact meaning. For Mattermost, `mention` is addressed to the bot and requires a visible reply in that thread. `thread` means the bot was previously mentioned there; every later message is delivered, and the agent decides whether to reply or `mark_handled`. An operator-declared ingest source's instructions arrive in the MCP manifest. If such a source is one-way, `chat_reply` is refused at the tool boundary; use `mark_handled` to settle its messages. Trigger presence does not remove the requirement to read and settle the message.
 
 ## Preview rules
 

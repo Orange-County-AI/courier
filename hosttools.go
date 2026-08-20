@@ -287,6 +287,15 @@ func (h *HostTools) ChatReply(ctx context.Context, args map[string]any) (ToolRes
 	if event.ConversationID != conversationID {
 		return ToolResult{Text: "conversation_id does not match delivery " + deliveryID, IsError: true, Status: 409}, nil
 	}
+	// Before any write: a connector with no answer channel refuses here, so no
+	// reply row exists to retry and the agent is told what it can still do.
+	if refuser, ok := h.connectors.Get(event.Connector).(replyRefuser); ok {
+		if reason := refuser.RefuseReply(DeliveryContext{
+			Delivery: *delivery, Event: *event, ConversationID: conversationID,
+		}); reason != "" {
+			return ToolResult{Text: reason, IsError: true, Status: 400}, nil
+		}
+	}
 	effectiveConversationID := conversationID
 	if replyMode != "" {
 		connector, err := h.connectors.Require(event.Connector)
